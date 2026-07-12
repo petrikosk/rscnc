@@ -32,7 +32,7 @@ impl Pipeline {
         Self::default()
     }
 
-    pub fn add(mut self, stage: impl Preprocessor + 'static) -> Self {
+    pub fn with(mut self, stage: impl Preprocessor + 'static) -> Self {
         self.stages.push(Box::new(stage));
         self
     }

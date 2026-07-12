@@ -196,8 +196,8 @@ impl Decoder {
             });
         } else if set_position {
             // G92: the current point gets the given programmed coordinates.
-            for i in 0..3 {
-                if let Some(v) = axis[i] {
+            for (i, v) in axis.iter().enumerate() {
+                if let Some(v) = v {
                     self.state.g92_offset[i] = v * scale - self.state.position[i];
                 }
             }

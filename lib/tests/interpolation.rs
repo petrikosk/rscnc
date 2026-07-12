@@ -366,7 +366,7 @@ fn preprocessed_rounded_square_is_faster_and_exact() {
     let sharp = run_program(src);
 
     let mut cnc = controller();
-    let mut pipeline = Pipeline::new().add(CornerRounding::new(2.0));
+    let mut pipeline = Pipeline::new().with(CornerRounding::new(2.0));
     cnc.load_program(src, DecoderConfig::default(), &mut pipeline)
         .unwrap();
     let mut driver = SimDriver::<3>::new();

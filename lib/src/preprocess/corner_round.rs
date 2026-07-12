@@ -46,7 +46,7 @@ impl CornerRounding {
         let t1 = la.tangent_at(len_a);
         let t2 = lb.tangent_at(0.0);
         let cos_theta = dot(&t1, &t2).clamp(-1.0, 1.0);
-        if cos_theta > 1.0 - 1e-9 || cos_theta < -1.0 + 1e-9 {
+        if !((-1.0 + 1e-9)..=(1.0 - 1e-9)).contains(&cos_theta) {
             return None; // colinear or reversal: nothing to round
         }
         let theta = cos_theta.acos(); // turn angle
