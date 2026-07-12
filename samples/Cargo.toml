@@ -1,0 +1,26 @@
+[package]
+name = "rscnc-samples"
+version = "0.1.0"
+authors = ["Petri Koskinen"]
+edition = "2021"
+
+[[bin]]
+name = "example_square"
+path = "src/example_square.rs"
+
+[[bin]]
+name = "example_arcs"
+path = "src/example_arcs.rs"
+
+[[bin]]
+name = "example_override"
+path = "src/example_override.rs"
+
+[[bin]]
+name = "example_file"
+path = "src/example_file.rs"
+
+[dependencies]
+rscnc = { path = "../lib" }
+# Pure-Rust SVG plotting - no external gnuplot installation required
+plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }
