@@ -288,8 +288,12 @@ impl Interpolator {
                     self.plan_stop_traj()?;
                     self.state = IplState::Pausing;
                 }
-            } else if (ovr - self.traj_override).abs() > 1e-9 {
-                // Override changed mid-segment: retarget from the current state
+            } else if (ovr - self.traj_override).abs() > 1e-9
+                || (self.single_step && self.planned_v_exit != 0.0)
+            {
+                // Override changed mid-segment (or single-step was switched on,
+                // which requires stopping at the segment end): retarget from
+                // the current state
                 self.plan_move_traj(ovr)?;
             }
         }
@@ -470,6 +474,7 @@ impl Interpolator {
             self.a_s = 0.0;
             self.update_pose();
             self.s_done += seg.length;
+            self.s_local = 0.0;
             self.cursor += 1;
             self.enter_next(ovr)?;
             if self.state != IplState::Running {
