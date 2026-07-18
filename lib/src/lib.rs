@@ -14,6 +14,8 @@
 //! (arc length). Look-ahead computes junction velocities so segments blend without
 //! stopping; feed override retargets the profile instantly on any cycle.
 
+#![warn(missing_docs)]
+
 pub mod decoder;
 pub mod driver;
 pub mod error;
@@ -29,6 +31,7 @@ pub mod types;
 mod controller;
 pub use controller::CncController;
 
+/// Convenience re-exports of the types needed for typical use.
 pub mod prelude {
     pub use crate::controller::CncController;
     pub use crate::decoder::{Decoder, DecoderConfig};

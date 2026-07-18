@@ -10,14 +10,24 @@ use crate::lookahead::LookAhead;
 use crate::preprocess::Pipeline;
 use crate::types::{AxisConfig, PathLimits};
 
+/// The complete CNC pipeline behind one interface: load a program with
+/// [`load_program`](Self::load_program), then call [`cycle`](Self::cycle)
+/// every control period. Runtime control (override, halt/resume, single
+/// step) goes through the public [`interpolator`](Self::interpolator).
 pub struct CncController<const N: usize, K: Kinematics<N>> {
+    /// Path-space → axis-space transform.
     pub kinematics: K,
+    /// The interpolator; exposes runtime control (`set_override`, `halt`, ...).
     pub interpolator: Interpolator,
+    /// Machine axis configuration.
     pub axis_config: AxisConfig<N>,
     time: f64,
 }
 
 impl<const N: usize, K: Kinematics<N>> CncController<N, K> {
+    /// New controller for an N-axis machine running at `cycle_time` seconds
+    /// per control cycle. Axes not carrying path geometry become auxiliary
+    /// synchronized axes.
     pub fn new(
         axis_config: AxisConfig<N>,
         limits: PathLimits,

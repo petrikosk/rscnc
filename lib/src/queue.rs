@@ -4,48 +4,59 @@
 use crate::geometry::GeoElem;
 use std::collections::VecDeque;
 
+/// FIFO of decoded path elements in program order.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GeoQueue {
     elems: VecDeque<GeoElem>,
 }
 
 impl GeoQueue {
+    /// An empty queue.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Append an element at the back.
     pub fn push(&mut self, e: GeoElem) {
         self.elems.push_back(e);
     }
 
+    /// Remove and return the front element.
     pub fn pop_front(&mut self) -> Option<GeoElem> {
         self.elems.pop_front()
     }
 
+    /// The front element, if any.
     pub fn front(&self) -> Option<&GeoElem> {
         self.elems.front()
     }
 
+    /// The element at index `i`, if any.
     pub fn get(&self, i: usize) -> Option<&GeoElem> {
         self.elems.get(i)
     }
 
+    /// Mutable access to the element at index `i`, if any.
     pub fn get_mut(&mut self, i: usize) -> Option<&mut GeoElem> {
         self.elems.get_mut(i)
     }
 
+    /// Number of elements in the queue.
     pub fn len(&self) -> usize {
         self.elems.len()
     }
 
+    /// `true` when the queue has no elements.
     pub fn is_empty(&self) -> bool {
         self.elems.is_empty()
     }
 
+    /// Iterate over the elements in program order.
     pub fn iter(&self) -> impl Iterator<Item = &GeoElem> {
         self.elems.iter()
     }
 
+    /// Iterate mutably over the elements in program order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut GeoElem> {
         self.elems.iter_mut()
     }

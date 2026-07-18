@@ -10,6 +10,8 @@ use crate::error::PreprocessError;
 use crate::geometry::{GeoElem, Geometry, Segment};
 use crate::queue::GeoQueue;
 
+/// Curvature velocity limit preprocessor: clamps arc feeds so the normal
+/// (centripetal) acceleration stays within the given budget.
 #[derive(Debug, Clone)]
 pub struct CurvatureVelocityLimit {
     /// Max normal (centripetal) acceleration: v ≤ sqrt(a_n / κ).
@@ -17,6 +19,7 @@ pub struct CurvatureVelocityLimit {
 }
 
 impl CurvatureVelocityLimit {
+    /// Limit with the given normal-acceleration budget (internal units/s²).
     pub fn new(max_normal_acceleration: f64) -> Self {
         Self {
             max_normal_acceleration,

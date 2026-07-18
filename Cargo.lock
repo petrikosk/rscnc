@@ -316,6 +316,8 @@ dependencies = [
 [[package]]
 name = "rsruckig"
 version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f1fd553ac99199900fcc11b6ecbb81462f6e0eba8d5db018056d868c4d1ddcf"
 dependencies = [
  "arrayvec",
  "num-traits",

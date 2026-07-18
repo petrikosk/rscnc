@@ -8,6 +8,8 @@ use crate::geometry::{dot, norm, sub, ArcSeg, GeoElem, GeoMove, Geometry, LineSe
 use crate::queue::GeoQueue;
 use crate::types::WorkPlane;
 
+/// Corner rounding preprocessor: fillets sharp corners between consecutive
+/// linear moves with tangent arcs of (at most) the given radius.
 #[derive(Debug, Clone)]
 pub struct CornerRounding {
     /// Requested fillet radius; reduced when the adjoining segments are short.
@@ -15,6 +17,7 @@ pub struct CornerRounding {
 }
 
 impl CornerRounding {
+    /// Corner rounding with the given fillet radius (internal units).
     pub fn new(radius: f64) -> Self {
         Self { radius }
     }

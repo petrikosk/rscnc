@@ -5,9 +5,13 @@ authors = ["Petri Koskinen"]
 edition = "2021"
 description = "CNC motion control layer (DIN 66025 G-code decoder, path preprocessing, jerk-limited look-ahead interpolator) on top of the rsruckig trajectory generator"
 license = "MIT"
+repository = "https://github.com/petrikosk/rscnc"
+readme = "../README.md"
+keywords = ["cnc", "gcode", "motion", "trajectory", "interpolation"]
+categories = ["science::robotics", "algorithms"]
 
 [dependencies]
-rsruckig = { path = "../../rsruckig/lib" }
+rsruckig = "3"
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]

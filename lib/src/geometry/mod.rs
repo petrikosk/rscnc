@@ -21,14 +21,18 @@ pub trait Segment {
     fn tangent_at(&self, s: f64) -> PathPoint;
     /// Curvature κ ≥ 0 at path parameter `s` (0 for lines).
     fn curvature_at(&self, s: f64) -> f64;
+    /// Start point of the segment (`point_at(0)`).
     fn start(&self) -> PathPoint;
+    /// End point of the segment (`point_at(length())`).
     fn end(&self) -> PathPoint;
 }
 
 /// Closed set of segment geometries used in the queue's hot path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Geometry {
+    /// A straight line segment.
     Line(LineSeg),
+    /// A circular (or helical) arc segment.
     Arc(ArcSeg),
 }
 
@@ -74,12 +78,15 @@ impl Segment for Geometry {
 /// A programmed move: geometry plus everything the planner needs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeoMove {
+    /// The move's path geometry.
     pub geo: Geometry,
     /// Programmed feed (internal units/s); the rapid feed for G0 moves.
     pub feed: f64,
+    /// `true` for G0 rapid traverse moves.
     pub is_rapid: bool,
     /// Auxiliary-axis positions at segment start/end; interpolated linearly over `s`.
     pub aux_start: Vec<f64>,
+    /// Auxiliary-axis positions at segment end; see [`GeoMove::aux_start`].
     pub aux_end: Vec<f64>,
     /// Tool radius correction mode active for this move.
     pub trc: TrcMode,
@@ -120,19 +127,28 @@ pub struct SyncEvent {
     pub spindle: Option<f64>,
     /// New tool from a T word, if any.
     pub tool: Option<u32>,
+    /// 1-based source line the event was programmed on.
     pub src_line: usize,
 }
 
 /// One element of the geometry queue.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeoElem {
+    /// A programmed move (line or arc).
     Move(GeoMove),
     /// G4 dwell.
-    Dwell { seconds: f64, src_line: usize },
+    Dwell {
+        /// Dwell duration in seconds.
+        seconds: f64,
+        /// 1-based source line the dwell was programmed on.
+        src_line: usize,
+    },
+    /// A synchronized event (M/S/T).
     Event(SyncEvent),
 }
 
 impl GeoElem {
+    /// 1-based source line the element was programmed on.
     pub fn src_line(&self) -> usize {
         match self {
             GeoElem::Move(m) => m.src_line,

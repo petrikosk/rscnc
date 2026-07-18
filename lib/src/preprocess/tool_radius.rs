@@ -22,12 +22,16 @@ use crate::types::{PathPoint, WorkPlane};
 const STAGE: &str = "ToolRadiusCorrection";
 const EPS: f64 = 1e-9;
 
+/// Tool radius correction preprocessor: offsets G41/G42 move chains by the
+/// tool radius (see the module docs for the offsetting rules).
 #[derive(Debug, Clone)]
 pub struct ToolRadiusCorrection {
+    /// Tool radius (internal units).
     pub tool_radius: f64,
 }
 
 impl ToolRadiusCorrection {
+    /// Correction with the given tool radius (internal units).
     pub fn new(tool_radius: f64) -> Self {
         Self { tool_radius }
     }

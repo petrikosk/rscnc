@@ -1,7 +1,7 @@
 # rscnc
 
 **CNC motion control in Rust** — a DIN 66025 (G-code) execution pipeline on top of the
-[rsruckig](https://github.com/heinemml/rsruckig) jerk-limited trajectory generator, modeled
+[rsruckig](https://github.com/petrikosk/rsruckig) jerk-limited trajectory generator, modeled
 after the CoDeSys SoftMotion CNC architecture:
 
 ```text
@@ -146,4 +146,4 @@ Known v1 behavior notes:
 
 ## License
 
-MIT — see `LICENSE.txt`. Depends on [rsruckig](../rsruckig) (MIT).
+MIT — see `LICENSE.txt`. Depends on [rsruckig](https://github.com/petrikosk/rsruckig) (MIT).

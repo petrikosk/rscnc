@@ -10,7 +10,9 @@ use crate::error::GcodeError;
 /// A single word, e.g. `X-12.5`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Word {
+    /// Address letter, uppercased (`G`, `X`, `F`, ...).
     pub letter: char,
+    /// Numeric value following the letter.
     pub value: f64,
     /// 1-based source line.
     pub line: usize,
@@ -21,6 +23,7 @@ pub struct Word {
 pub struct ParsedBlock {
     /// Program line number from an `N` word, if present.
     pub number: Option<u32>,
+    /// The block's words in source order, `N` word excluded.
     pub words: Vec<Word>,
     /// 1-based source line in the input text.
     pub src_line: usize,

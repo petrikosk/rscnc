@@ -17,7 +17,9 @@ use crate::queue::GeoQueue;
 
 /// A queue → queue transform.
 pub trait Preprocessor {
+    /// Stage name used in error reports.
     fn name(&self) -> &'static str;
+    /// Transform the queue, consuming it.
     fn process(&mut self, queue: GeoQueue) -> Result<GeoQueue, PreprocessError>;
 }
 
@@ -28,19 +30,23 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    /// An empty pipeline (passes queues through unchanged).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Append a stage (builder style).
     pub fn with(mut self, stage: impl Preprocessor + 'static) -> Self {
         self.stages.push(Box::new(stage));
         self
     }
 
+    /// `true` when the pipeline has no stages.
     pub fn is_empty(&self) -> bool {
         self.stages.is_empty()
     }
 
+    /// Run the queue through all stages in order.
     pub fn run(&mut self, mut queue: GeoQueue) -> Result<GeoQueue, PreprocessError> {
         for stage in &mut self.stages {
             queue = stage.process(queue)?;

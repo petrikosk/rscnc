@@ -46,6 +46,7 @@ pub enum IplState {
 /// Per-cycle interpolator output.
 #[derive(Debug, Clone)]
 pub struct IplOutput {
+    /// Interpolator state after this cycle.
     pub state: IplState,
     /// Position on the programmed path.
     pub path_position: PathPoint,
@@ -71,6 +72,10 @@ pub struct IplOutput {
     pub progress: f64,
 }
 
+/// The path interpolator. [`load`](Self::load) a planned queue, then call
+/// [`cycle`](Self::cycle) every control period; runtime control via
+/// [`set_override`](Self::set_override), [`halt`](Self::halt) /
+/// [`resume`](Self::resume) and [`set_single_step`](Self::set_single_step).
 pub struct Interpolator {
     limits: PathLimits,
     lookahead: LookAhead,
@@ -115,6 +120,9 @@ pub struct Interpolator {
 }
 
 impl Interpolator {
+    /// New idle interpolator. `aux_max_velocity` holds the velocity limits
+    /// of the auxiliary axes in decoder order; `cycle_time` is the control
+    /// period in seconds.
     pub fn new(
         limits: PathLimits,
         lookahead: LookAhead,
@@ -200,6 +208,7 @@ impl Interpolator {
         self.override_pct = if factor < MIN_OVERRIDE { 0.0 } else { factor };
     }
 
+    /// The current feed override factor.
     pub fn override_factor(&self) -> f64 {
         self.override_pct
     }
@@ -225,10 +234,12 @@ impl Interpolator {
         self.step_pending = true;
     }
 
+    /// The current interpolator state.
     pub fn state(&self) -> IplState {
         self.state
     }
 
+    /// The control period in seconds.
     pub fn cycle_time(&self) -> f64 {
         self.cycle_time
     }

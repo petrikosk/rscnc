@@ -3,13 +3,17 @@
 use super::{norm, sub, Segment};
 use crate::types::PathPoint;
 
+/// A straight line segment from `p0` to `p1`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineSeg {
+    /// Start point.
     pub p0: PathPoint,
+    /// End point.
     pub p1: PathPoint,
 }
 
 impl LineSeg {
+    /// Line segment from `p0` to `p1`.
     pub fn new(p0: PathPoint, p1: PathPoint) -> Self {
         Self { p0, p1 }
     }

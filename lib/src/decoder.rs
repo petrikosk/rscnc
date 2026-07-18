@@ -18,6 +18,8 @@ use crate::geometry::{ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, SyncEvent};
 use crate::queue::GeoQueue;
 use crate::types::WorkPlane;
 
+/// Decoder configuration: machine start pose, auxiliary axis letters and
+/// tolerances.
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
     /// Letters of the auxiliary (non-path) axes, in machine order.
@@ -47,6 +49,9 @@ impl Default for DecoderConfig {
     }
 }
 
+/// The DIN 66025 decoder: turns parsed blocks into geometry queue elements
+/// while tracking modal state. Use [`Decoder::decode_program`] for the
+/// common whole-program case.
 pub struct Decoder {
     cfg: DecoderConfig,
     state: ModalState,
@@ -55,6 +60,8 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// New decoder starting from the configured machine pose with default
+    /// modal state.
     pub fn new(cfg: DecoderConfig) -> Self {
         let mut state = ModalState::new(cfg.aux_letters.len());
         state.position = cfg.start_position;

@@ -54,6 +54,7 @@ impl PathAxes {
         }
     }
 
+    /// Number of path axes (2 or 3).
     pub fn count(&self) -> usize {
         match self {
             PathAxes::Two(_) => 2,
@@ -75,7 +76,9 @@ pub struct AxisConfig<const N: usize> {
     pub axis_names: [&'static str; N],
     /// Per-axis velocity limits (used for auxiliary-axis feed caps).
     pub max_velocity: [f64; N],
+    /// Per-axis acceleration limits.
     pub max_acceleration: [f64; N],
+    /// Per-axis jerk limits.
     pub max_jerk: [f64; N],
 }
 
@@ -117,6 +120,8 @@ pub struct PathLimits {
 }
 
 impl PathLimits {
+    /// Path limits from the four maxima (velocity, tangential acceleration,
+    /// tangential jerk, normal acceleration).
     pub fn new(
         max_velocity: f64,
         max_acceleration: f64,

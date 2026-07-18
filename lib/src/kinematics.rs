@@ -35,6 +35,7 @@ pub trait Kinematics<const N: usize> {
 /// axes, auxiliary values fill the remaining axes in order.
 #[derive(Debug, Clone)]
 pub struct CartesianKinematics<const N: usize> {
+    /// Which machine axes carry the path geometry.
     pub path_axes: PathAxes,
     /// Machine-axis indices of the auxiliary axes, in the order the decoder
     /// produces them.

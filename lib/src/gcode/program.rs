@@ -19,16 +19,20 @@ pub enum MotionMode {
 /// G90 / G91.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DistanceMode {
+    /// G90 - axis words are absolute coordinates.
     #[default]
     Absolute,
+    /// G91 - axis words are increments from the current position.
     Incremental,
 }
 
 /// G71/G21 (mm) or G70/G20 (inch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Units {
+    /// G71/G21 - millimeters.
     #[default]
     Mm,
+    /// G70/G20 - inches.
     Inch,
 }
 
@@ -60,14 +64,21 @@ pub enum TrcMode {
 /// feed in internal units/s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModalState {
+    /// Active motion mode (G0/G1/G2/G3).
     pub motion: MotionMode,
+    /// Active work plane (G17/G18/G19).
     pub plane: WorkPlane,
+    /// Absolute or incremental distance mode (G90/G91).
     pub distance: DistanceMode,
+    /// Active unit system (G70/G71).
     pub units: Units,
     /// Programmed feed, internal units/s (F is units/min in the source).
     pub feed: f64,
+    /// Programmed spindle speed from the last S word.
     pub spindle_speed: f64,
+    /// Active tool from the last T word.
     pub tool: u32,
+    /// Active tool radius correction mode (G40/G41/G42).
     pub trc: TrcMode,
     /// Programmed position of the path axes (after G92 offset), internal units.
     pub position: [f64; 3],
@@ -75,10 +86,13 @@ pub struct ModalState {
     pub g92_offset: [f64; 3],
     /// Auxiliary (non-path) axis programmed positions, internal units.
     pub aux_position: Vec<f64>,
+    /// G92 offsets of the auxiliary axes.
     pub aux_g92_offset: Vec<f64>,
 }
 
 impl ModalState {
+    /// Initial modal state (all defaults, everything at 0) for a machine
+    /// with `aux_axes` auxiliary axes.
     pub fn new(aux_axes: usize) -> Self {
         Self {
             motion: MotionMode::default(),

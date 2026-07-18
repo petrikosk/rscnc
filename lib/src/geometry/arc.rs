@@ -8,12 +8,17 @@
 use super::{Segment};
 use crate::types::{PathPoint, WorkPlane};
 
+/// A circular (or helical) arc in a work plane, with optional linear
+/// radius interpolation between `r_start` and `r_end` (spiral correction).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArcSeg {
+    /// Work plane the arc lies in.
     pub plane: WorkPlane,
     /// Full 3D center; the normal-axis component is the start point's normal coordinate.
     pub center: PathPoint,
+    /// Radius at the start point.
     pub r_start: f64,
+    /// Radius at the end point (differs from `r_start` only within the decoder's tolerance).
     pub r_end: f64,
     /// Start angle in the plane: `atan2(second - c, first - c)`.
     pub theta0: f64,
