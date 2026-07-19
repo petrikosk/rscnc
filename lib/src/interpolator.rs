@@ -10,6 +10,11 @@
 //! cycle-quantization errors. Feed-override changes, pause (override 0 /
 //! halt) and resume simply retarget the profile from the current state.
 
+use alloc::{format, string::ToString, vec, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::error::CncError;
 use crate::geometry::{GeoElem, GeoMove, Segment, SyncEvent};
 use crate::lookahead::{LookAhead, PlannedSegment};

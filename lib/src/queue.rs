@@ -2,7 +2,7 @@
 //! in program order, consumed by preprocessors and the interpolator.
 
 use crate::geometry::GeoElem;
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 
 /// FIFO of decoded path elements in program order.
 #[derive(Debug, Clone, Default, PartialEq)]

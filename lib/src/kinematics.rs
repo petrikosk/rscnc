@@ -1,5 +1,7 @@
 //! Kinematic transform from path space to machine-axis space.
 
+use alloc::{format, vec::Vec};
+
 use crate::error::KinError;
 use crate::types::{PathAxes, PathPoint};
 

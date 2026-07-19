@@ -11,6 +11,11 @@
 //! unit mode, `F` (units/min) is converted to units/s. Auxiliary axis words
 //! are *not* unit-scaled (they are typically rotary degrees).
 
+use alloc::{format, string::String, vec, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::error::DecodeError;
 use crate::gcode::lexer::{lex, ParsedBlock};
 use crate::gcode::program::{DistanceMode, ModalState, MotionMode, TrcMode, Units};

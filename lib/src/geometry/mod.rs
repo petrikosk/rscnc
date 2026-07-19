@@ -7,6 +7,11 @@ mod line;
 pub use arc::ArcSeg;
 pub use line::LineSeg;
 
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::gcode::TrcMode;
 use crate::types::PathPoint;
 

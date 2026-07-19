@@ -112,6 +112,23 @@ rotary degrees). Arcs follow DIN/LinuxCNC conventions: IJK are incremental offse
 the start point; `R > 0` selects the minor, `R < 0` the major arc; a small start/end radius
 mismatch (CAM output) is absorbed by linear spiral correction within `radius_tolerance`.
 
+## `no_std` support
+
+The library is `no_std`-compatible (an allocator is still required — the queue,
+decoder and error types use `alloc`). Disable default features and enable `libm`
+for float math:
+
+```toml
+[dependencies]
+rscnc = { version = "0.1", default-features = false, features = ["libm"] }
+```
+
+```bash
+cargo build --no-default-features --features libm --target thumbv7em-none-eabihf
+```
+
+Either `std` (default) or `libm` must be enabled.
+
 ## Testing
 
 ```bash
@@ -131,7 +148,7 @@ cargo test
 Implemented against the CoDeSys SoftMotion CNC feature model; not yet included (backlog):
 splines (G5), ellipses, 3D tool radius correction, subprograms/jumps, spline smoothing of
 corners, non-stopping ("fly-by") M events, streaming/windowed preprocessing for unbounded
-programs, backward move on path, fieldbus drivers (EtherCAT/CiA402), `no_std`.
+programs, backward move on path, fieldbus drivers (EtherCAT/CiA402).
 
 Known v1 behavior notes:
 

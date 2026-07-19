@@ -13,8 +13,27 @@
 //! The interpolator runs rsruckig as a **1-DoF planner on the path parameter `s`**
 //! (arc length). Look-ahead computes junction velocities so segments blend without
 //! stopping; feed override retargets the profile instantly on any cycle.
+//!
+//! # `no_std`
+//!
+//! The crate is `no_std`-compatible with an allocator: disable default features
+//! and enable `libm` (float math via the `libm` crate):
+//!
+//! ```toml
+//! rscnc = { version = "0.1", default-features = false, features = ["libm"] }
+//! ```
+//!
+//! Either the `std` (default) or `libm` feature must be enabled.
 
 #![warn(missing_docs)]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(any(feature = "std", feature = "libm")))]
+compile_error!(
+    "rscnc requires either the `std` feature (default) or the `libm` feature for float math"
+);
+
+extern crate alloc;
 
 pub mod decoder;
 pub mod driver;

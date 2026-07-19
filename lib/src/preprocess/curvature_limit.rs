@@ -5,6 +5,9 @@
 //! this preprocessor lets a machine apply a separate (stricter) budget and
 //! makes the cap visible in the queue.
 
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use super::Preprocessor;
 use crate::error::PreprocessError;
 use crate::geometry::{GeoElem, Geometry, Segment};

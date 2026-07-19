@@ -1,6 +1,8 @@
 //! High-level facade wiring decoder → preprocessors → interpolator →
 //! kinematics → axis driver.
 
+use alloc::{format, vec::Vec};
+
 use crate::decoder::{Decoder, DecoderConfig};
 use crate::driver::AxisDriver;
 use crate::error::CncError;

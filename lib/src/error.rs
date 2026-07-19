@@ -1,5 +1,7 @@
 //! Error types for every pipeline stage.
 
+use alloc::string::String;
+
 use thiserror::Error;
 
 /// Top-level error type; each stage's error converts into it.

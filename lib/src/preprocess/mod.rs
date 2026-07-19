@@ -12,6 +12,8 @@ pub use corner_round::CornerRounding;
 pub use curvature_limit::CurvatureVelocityLimit;
 pub use tool_radius::ToolRadiusCorrection;
 
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::error::PreprocessError;
 use crate::queue::GeoQueue;
 

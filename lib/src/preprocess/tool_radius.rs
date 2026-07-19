@@ -12,6 +12,11 @@
 //! smaller than the tool radius (an offset element that vanishes when
 //! trimmed) is reported as an error rather than resolved by removing loops.
 
+use alloc::{format, string::String, vec, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use super::Preprocessor;
 use crate::error::PreprocessError;
 use crate::gcode::TrcMode;

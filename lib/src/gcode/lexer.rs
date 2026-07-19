@@ -5,6 +5,11 @@
 //! decimal number (`G1`, `X-12.5`, `F1500.`). Whitespace between and inside
 //! words is ignored (`G 01` is valid, as legacy paper-tape dialects allow).
 
+use alloc::{format, string::String, vec::Vec};
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::error::GcodeError;
 
 /// A single word, e.g. `X-12.5`.

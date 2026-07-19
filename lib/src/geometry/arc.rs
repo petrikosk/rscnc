@@ -5,6 +5,11 @@
 //! mismatch, and interpolating the radius keeps both endpoints exactly on
 //! the programmed path so consecutive segments stay C0-continuous.
 
+use alloc::{format, string::String};
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use super::{Segment};
 use crate::types::{PathPoint, WorkPlane};
 

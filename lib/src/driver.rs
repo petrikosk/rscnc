@@ -2,6 +2,8 @@
 //! cycle) will live. v1 ships a simulation driver that logs everything for
 //! plotting and test assertions.
 
+use alloc::vec::Vec;
+
 /// Per-cycle axis setpoint consumer.
 pub trait AxisDriver<const N: usize> {
     /// Receive the axis position and velocity setpoints for the cycle ending at `time`.

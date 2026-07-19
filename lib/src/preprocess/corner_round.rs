@@ -2,6 +2,11 @@
 //! between two consecutive linear moves by a tangent arc, so the look-ahead
 //! can carry velocity through the corner instead of slowing for it.
 
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use super::Preprocessor;
 use crate::error::PreprocessError;
 use crate::geometry::{dot, norm, sub, ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment};

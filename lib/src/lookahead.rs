@@ -1,6 +1,11 @@
 //! Look-ahead planner: per-segment velocity caps and junction (corner)
 //! velocities, so consecutive segments blend without stopping.
 
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use num_traits::Float;
+
 use crate::geometry::{dot, GeoElem, GeoMove, Segment};
 use crate::queue::GeoQueue;
 use crate::types::PathLimits;

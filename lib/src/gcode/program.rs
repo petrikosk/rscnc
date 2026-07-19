@@ -1,5 +1,7 @@
 //! Modal program state (DIN 66025 modal groups) tracked by the decoder.
 
+use alloc::{vec, vec::Vec};
+
 use crate::types::WorkPlane;
 
 /// Modal motion group.

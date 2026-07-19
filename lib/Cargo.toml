@@ -10,9 +10,18 @@ readme = "../README.md"
 keywords = ["cnc", "gcode", "motion", "trajectory", "interpolation"]
 categories = ["science::robotics", "algorithms"]
 
+[features]
+default = ["std"]
+# Standard library support (float math via std intrinsics).
+std = ["rsruckig/std", "num-traits/std"]
+# Float math via `libm` for `no_std` builds. Either `std` or `libm` must be
+# enabled. `no_std` builds still require a global allocator (`alloc`).
+libm = ["rsruckig/libm", "rsruckig/alloc", "num-traits/libm"]
+
 [dependencies]
-rsruckig = "3"
+rsruckig = { version = "3", default-features = false }
 thiserror = { version = "2", default-features = false }
+num-traits = { version = "0.2.19", default-features = false }
 
 [dev-dependencies]
 proptest = "1"
