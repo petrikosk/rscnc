@@ -129,6 +129,13 @@ cargo build --no-default-features --features libm --target thumbv7em-none-eabihf
 
 Either `std` (default) or `libm` must be enabled.
 
+`qemu-demo/` is a bare-metal smoke test that runs the full pipeline on an
+emulated Cortex-M3 without FPU (QEMU `mps2-an385`, semihosting output):
+
+```bash
+cd qemu-demo && cargo run --release   # requires qemu-system-arm on PATH
+```
+
 ## Testing
 
 ```bash

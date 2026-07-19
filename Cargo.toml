@@ -1,5 +1,6 @@
 [workspace]
 members = ["lib", "samples"]
+exclude = ["qemu-demo"]
 resolver = "2"
 
 [profile.release]
