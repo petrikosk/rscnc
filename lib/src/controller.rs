@@ -59,15 +59,32 @@ impl<const N: usize, K: Kinematics<N>> CncController<N, K> {
         decoder_cfg: DecoderConfig,
         pipeline: &mut Pipeline,
     ) -> Result<(), CncError> {
-        let queue = Decoder::decode_program(decoder_cfg, source)?;
+        let queue = Decoder::decode_source(decoder_cfg, source)?;
         let queue = pipeline.run(queue)?;
         self.time = 0.0;
         self.interpolator.load(queue)
     }
 
     /// One control cycle: interpolate, transform, write axis setpoints.
+    ///
+    /// Allocates a fresh [`IplOutput`] per call; for real-time use keep one
+    /// buffer from [`Interpolator::output_buffer`] and call
+    /// [`cycle_into`](Self::cycle_into) instead.
     pub fn cycle(&mut self, driver: &mut impl AxisDriver<N>) -> Result<IplOutput, CncError> {
-        let out = self.interpolator.cycle()?;
+        let mut out = self.interpolator.output_buffer();
+        self.cycle_into(driver, &mut out)?;
+        Ok(out)
+    }
+
+    /// One control cycle, writing the interpolator output into an existing
+    /// buffer (see [`Interpolator::cycle_into`]): no heap allocation in
+    /// steady state.
+    pub fn cycle_into(
+        &mut self,
+        driver: &mut impl AxisDriver<N>,
+        out: &mut IplOutput,
+    ) -> Result<(), CncError> {
+        self.interpolator.cycle_into(out)?;
         let mut pos = [0.0; N];
         let mut vel = [0.0; N];
         self.kinematics
@@ -81,7 +98,7 @@ impl<const N: usize, K: Kinematics<N>> CncController<N, K> {
         )?;
         self.time += self.interpolator.cycle_time();
         driver.write_setpoints(self.time, &pos, &vel);
-        Ok(out)
+        Ok(())
     }
 
     /// Run until the program finishes (simulation convenience). Returns the

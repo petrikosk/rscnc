@@ -159,11 +159,7 @@ mod tests {
 
     #[test]
     fn right_angle_fillet_is_tangent() {
-        let q = Decoder::decode_program(
-            DecoderConfig::default(),
-            "G1 F600 X10\nY10\n",
-        )
-        .unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nY10\n").unwrap();
         let out = CornerRounding::new(2.0).process(q).unwrap();
         let moves: Vec<_> = out
             .iter()
@@ -183,7 +179,10 @@ mod tests {
         let t_bs = b.geo.tangent_at(0.0);
         for i in 0..3 {
             assert!((t_ae[i] - t_as[i]).abs() < 1e-9, "start tangent mismatch");
-            assert!((t_arc_end[i] - t_bs[i]).abs() < 1e-9, "end tangent mismatch");
+            assert!(
+                (t_arc_end[i] - t_bs[i]).abs() < 1e-9,
+                "end tangent mismatch"
+            );
         }
         // Endpoints connect
         for i in 0..3 {
@@ -200,11 +199,11 @@ mod tests {
     #[test]
     fn short_segments_shrink_radius_and_events_block() {
         // 1mm legs: radius clamps to 0.45·1/tan(45°) = 0.45
-        let q = Decoder::decode_program(DecoderConfig::default(), "G1 F600 X1\nY1\n").unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), "G1 F600 X1\nY1\n").unwrap();
         let out = CornerRounding::new(100.0).process(q).unwrap();
         assert_eq!(out.len(), 3);
         // An event between moves prevents rounding
-        let q = Decoder::decode_program(DecoderConfig::default(), "G1 F600 X10 M8\nY10\n").unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10 M8\nY10\n").unwrap();
         let out = CornerRounding::new(2.0).process(q).unwrap();
         assert_eq!(out.len(), 3); // move, event, move - unchanged
     }

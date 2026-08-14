@@ -90,8 +90,8 @@ impl LookAhead {
         // following segments' exits.
         for i in (0..n.saturating_sub(1)).rev() {
             if segs[i + 1].queue_index == segs[i].queue_index + 1 {
-                let reachable = (segs[i + 1].v_exit.powi(2) + 2.0 * a_eff * segs[i + 1].length)
-                    .sqrt();
+                let reachable =
+                    (segs[i + 1].v_exit.powi(2) + 2.0 * a_eff * segs[i + 1].length).sqrt();
                 segs[i].v_exit = segs[i].v_exit.min(reachable);
             }
         }
@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn plan(src: &str) -> Vec<PlannedSegment> {
-        let q = Decoder::decode_program(DecoderConfig::default(), src).unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), src).unwrap();
         LookAhead::default().plan(&q, &limits(), &[])
     }
 
@@ -208,7 +208,10 @@ mod tests {
         let arc_cap = (500.0f64 * 2.0).sqrt();
         assert!(p[0].v_exit <= arc_cap + 1e-9, "v_exit {}", p[0].v_exit);
         assert!(p[1].v_cap <= arc_cap.min(40.0) + 1e-9);
-        assert!(p[1].v_cap > arc_cap - 1e-9, "curvature should be the binding cap");
+        assert!(
+            p[1].v_cap > arc_cap - 1e-9,
+            "curvature should be the binding cap"
+        );
     }
 
     #[test]

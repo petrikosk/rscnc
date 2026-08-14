@@ -5,7 +5,7 @@
 //! mismatch, and interpolating the radius keeps both endpoints exactly on
 //! the programmed path so consecutive segments stay C0-continuous.
 
-use super::{Segment};
+use super::Segment;
 use crate::types::{PathPoint, WorkPlane};
 
 /// A circular (or helical) arc in a work plane, with optional linear
@@ -97,7 +97,9 @@ impl ArcSeg {
         let dy = end[i1] - start[i1];
         let chord = (dx * dx + dy * dy).sqrt();
         if chord <= 0.0 {
-            return Err("radius-format arc with coincident start and end (full circle requires IJK)".into());
+            return Err(
+                "radius-format arc with coincident start and end (full circle requires IJK)".into(),
+            );
         }
         let radius = r.abs();
         let half = chord / 2.0;
@@ -269,25 +271,14 @@ mod tests {
     #[test]
     fn radius_format_minor_major() {
         // Quarter circle (1,0) -> (0,1), radius 1: minor CCW arc has center at origin
-        let minor = ArcSeg::from_radius(
-            WorkPlane::Xy,
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            1.0,
-            true,
-        )
-        .unwrap();
+        let minor = ArcSeg::from_radius(WorkPlane::Xy, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 1.0, true)
+            .unwrap();
         assert!((minor.center[0]).abs() < 1e-9 && (minor.center[1]).abs() < 1e-9);
         assert!((minor.sweep - FRAC_PI_2).abs() < 1e-9);
         // Negative R selects the major (270°) arc; its center is at (1,1)
-        let major = ArcSeg::from_radius(
-            WorkPlane::Xy,
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            -1.0,
-            true,
-        )
-        .unwrap();
+        let major =
+            ArcSeg::from_radius(WorkPlane::Xy, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], -1.0, true)
+                .unwrap();
         assert!((major.center[0] - 1.0).abs() < 1e-9 && (major.center[1] - 1.0).abs() < 1e-9);
         assert!((major.sweep - 3.0 * FRAC_PI_2).abs() < 1e-9);
     }

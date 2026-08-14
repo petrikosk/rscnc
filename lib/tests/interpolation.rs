@@ -12,12 +12,8 @@ fn limits() -> PathLimits {
 }
 
 fn controller() -> CncController<3, CartesianKinematics<3>> {
-    let axis_config = AxisConfig::<3>::cartesian(
-        ["X", "Y", "Z"],
-        [50.0; 3],
-        [500.0; 3],
-        [5000.0; 3],
-    );
+    let axis_config =
+        AxisConfig::<3>::cartesian(["X", "Y", "Z"], [50.0; 3], [500.0; 3], [5000.0; 3]);
     CncController::new(
         axis_config,
         limits(),
@@ -77,7 +73,10 @@ fn assert_path_limits(run: &Run, lim: &PathLimits) {
             out.path_velocity,
             lim.max_velocity
         );
-        assert!(out.path_velocity >= 0.0, "cycle {i}: negative path velocity");
+        assert!(
+            out.path_velocity >= 0.0,
+            "cycle {i}: negative path velocity"
+        );
         if i > 0 {
             let dv = out.path_velocity - run.outputs[i - 1].path_velocity;
             assert!(
@@ -147,7 +146,11 @@ fn full_circle_stays_on_circle() {
         let dx = out.path_position[0] - 10.0;
         let dy = out.path_position[1];
         let r = (dx * dx + dy * dy).sqrt();
-        assert!((r - 10.0).abs() < 1e-9, "cycle {i}: radial error {}", r - 10.0);
+        assert!(
+            (r - 10.0).abs() < 1e-9,
+            "cycle {i}: radial error {}",
+            r - 10.0
+        );
     }
     let end = last(&run);
     assert!(end.path_position[0].abs() < 1e-8 && end.path_position[1].abs() < 1e-8);
@@ -240,7 +243,10 @@ fn override_pause_resume() {
         .iter()
         .map(|o| o.path_velocity)
         .fold(0.0, f64::max);
-    assert!(v_max_seen > 20.0, "120% override should exceed programmed feed");
+    assert!(
+        v_max_seen > 20.0,
+        "120% override should exceed programmed feed"
+    );
     assert!(v_max_seen <= 24.0 + 1e-6);
     let end = last(&run);
     assert!((end.path_position[0] - 30.0).abs() < 1e-8);
@@ -336,7 +342,8 @@ fn aux_axis_caps_path_velocity() {
         ..Default::default()
     };
     let mut pipeline = Pipeline::new();
-    cnc.load_program("G1 F1200 X10 A90\n", cfg, &mut pipeline).unwrap();
+    cnc.load_program("G1 F1200 X10 A90\n", cfg, &mut pipeline)
+        .unwrap();
     let mut driver = SimDriver::<4>::new();
     let mut v_max_seen = 0.0f64;
     let mut aux_v_max = 0.0f64;
@@ -345,7 +352,11 @@ fn aux_axis_caps_path_velocity() {
         v_max_seen = v_max_seen.max(out.path_velocity);
         aux_v_max = aux_v_max.max(out.aux_velocity[0].abs());
         if out.state == IplState::Finished {
-            assert!((out.aux[0] - 90.0).abs() < 1e-8, "A ended at {}", out.aux[0]);
+            assert!(
+                (out.aux[0] - 90.0).abs() < 1e-8,
+                "A ended at {}",
+                out.aux[0]
+            );
             assert!(
                 v_max_seen <= 10.0 * 10.0 / 90.0 + 1e-6,
                 "path velocity {v_max_seen} exceeds aux cap"
@@ -358,6 +369,100 @@ fn aux_axis_caps_path_velocity() {
         }
     }
     panic!("aux program did not finish");
+}
+
+#[test]
+fn planned_facts_are_readable_from_the_interpolator() {
+    // A rapid from a non-zero machine start, then a fed move, with an aux axis
+    let cfg = DecoderConfig {
+        aux_letters: vec!['A'],
+        start_position: [1.0, 2.0, 0.0],
+        start_aux: vec![7.0],
+        ..Default::default()
+    };
+    let queue = Decoder::decode_source(cfg, "G0 X5 A10\nG1 F600 Y12\n").expect("decodes");
+    let mut ipl = Interpolator::new(limits(), LookAhead::default(), vec![100.0], DT);
+    ipl.load(queue).expect("loads");
+
+    // (b) the start pose is available before the first cycle...
+    assert_eq!(ipl.start_position(), [1.0, 2.0, 0.0]);
+    assert_eq!(ipl.start_aux(), &[7.0]);
+    // (c) ...as is the planned total length: rapid 4 mm + fed move 10 mm
+    assert!(
+        (ipl.total_length() - 14.0).abs() < 1e-9,
+        "{}",
+        ipl.total_length()
+    );
+    // (a) and the first element is the rapid
+    assert!(ipl.current_is_rapid());
+
+    // ...and the seeded output buffer carries the start pose.
+    let mut out = ipl.output_buffer();
+    assert_eq!(out.path_position, [1.0, 2.0, 0.0]);
+    assert_eq!(out.aux, vec![7.0]);
+    assert_eq!(out.state, IplState::Running);
+
+    // The rapid flag follows the path element under the interpolator.
+    let mut rapid_while_first_object = true;
+    let mut saw_fed_move = false;
+    for _ in 0..200_000 {
+        ipl.cycle_into(&mut out).expect("cycle");
+        if out.obj_no == 0 {
+            rapid_while_first_object &= ipl.current_is_rapid();
+        } else {
+            saw_fed_move = true;
+            assert!(!ipl.current_is_rapid(), "G1 move reported as a rapid");
+        }
+        if out.state == IplState::Finished {
+            break;
+        }
+    }
+    assert!(rapid_while_first_object, "G0 move not reported as a rapid");
+    assert!(saw_fed_move, "second move never reached");
+    assert_eq!(out.state, IplState::Finished);
+    assert!((out.progress - 1.0).abs() < 1e-12);
+    assert!((out.s_total - ipl.total_length()).abs() < 1e-8);
+}
+
+#[test]
+fn cycle_into_is_identical_to_cycle() {
+    let src = "G1 F1200 X10 A45 M8\nG4 P0.05\nG3 X14 Y4 I0 J4 A90\nG0 X0 Y0\n";
+    let cfg = || DecoderConfig {
+        aux_letters: vec!['A'],
+        start_aux: vec![0.0],
+        ..Default::default()
+    };
+    let make = || {
+        let mut ipl = Interpolator::new(limits(), LookAhead::default(), vec![100.0], DT);
+        ipl.load(Decoder::decode_source(cfg(), src).expect("decodes"))
+            .expect("loads");
+        ipl
+    };
+    let mut allocating = make();
+    let mut reusing = make();
+    let mut buf = reusing.output_buffer();
+
+    for i in 0..200_000 {
+        let a = allocating.cycle().expect("cycle");
+        reusing.cycle_into(&mut buf).expect("cycle_into");
+        assert_eq!(a.state, buf.state, "cycle {i}");
+        assert_eq!(a.path_position, buf.path_position, "cycle {i}");
+        assert_eq!(a.path_tangent, buf.path_tangent, "cycle {i}");
+        assert_eq!(a.path_velocity, buf.path_velocity, "cycle {i}");
+        assert_eq!(a.path_acceleration, buf.path_acceleration, "cycle {i}");
+        assert_eq!(a.aux, buf.aux, "cycle {i}");
+        assert_eq!(a.aux_velocity, buf.aux_velocity, "cycle {i}");
+        assert_eq!(a.events, buf.events, "cycle {i}");
+        assert_eq!(a.src_line, buf.src_line, "cycle {i}");
+        assert_eq!(a.obj_no, buf.obj_no, "cycle {i}");
+        assert_eq!(a.s_total, buf.s_total, "cycle {i}");
+        assert_eq!(a.progress, buf.progress, "cycle {i}");
+        if a.state == IplState::Finished {
+            // The M8 event was delivered exactly once, through both roads
+            return;
+        }
+    }
+    panic!("program did not finish");
 }
 
 #[test]

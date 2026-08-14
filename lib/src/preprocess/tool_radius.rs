@@ -230,10 +230,7 @@ impl ToolRadiusCorrection {
             };
             off.push(Tagged {
                 src: k,
-                mv: GeoMove {
-                    geo,
-                    ..mv.clone()
-                },
+                mv: GeoMove { geo, ..mv.clone() },
             });
         }
         if off.is_empty() {
@@ -494,12 +491,7 @@ fn circle_circle(a1: &ArcSeg, a2: &ArcSeg, plane: WorkPlane) -> Vec<V2> {
 }
 
 /// Trim the end of a geometry to `pt` (which lies on it).
-fn trim_end(
-    geo: &mut Geometry,
-    pt: V2,
-    plane: WorkPlane,
-    normal_coord: f64,
-) -> Result<(), String> {
+fn trim_end(geo: &mut Geometry, pt: V2, plane: WorkPlane, normal_coord: f64) -> Result<(), String> {
     match geo {
         Geometry::Line(l) => {
             l.p1 = pt.to3(plane, normal_coord);
@@ -574,7 +566,7 @@ mod tests {
         // CCW square, tool left (G41) = inside the contour, radius 1:
         // every corner is an inner corner → all joins are trims, no arcs.
         let src = "G41 G1 F600 X10\nY10\nX0\nY0\nG40\n";
-        let q = Decoder::decode_program(DecoderConfig::default(), src).unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), src).unwrap();
         let out = ToolRadiusCorrection::new(1.0).process(q).unwrap();
         let m = moves(&out);
         // lead-in + 4 trimmed offset lines + lead-out = 6
@@ -583,8 +575,16 @@ mod tests {
         // Tool left of +X travel is the +Y side: first offset line at y = +1,
         // trimmed at the inner corner to x = 9
         let l1 = &m[1];
-        assert!((l1.geo.start()[1] - 1.0).abs() < 1e-9, "y = {}", l1.geo.start()[1]);
-        assert!((l1.geo.end()[0] - 9.0).abs() < 1e-9, "x = {}", l1.geo.end()[0]);
+        assert!(
+            (l1.geo.start()[1] - 1.0).abs() < 1e-9,
+            "y = {}",
+            l1.geo.start()[1]
+        );
+        assert!(
+            (l1.geo.end()[0] - 9.0).abs() < 1e-9,
+            "x = {}",
+            l1.geo.end()[0]
+        );
         assert!((l1.geo.end()[1] - 1.0).abs() < 1e-9);
     }
 
@@ -592,7 +592,7 @@ mod tests {
     fn square_right_correction_gets_transition_arcs() {
         // CCW square with G42 (tool right) = outside: outer corners → arcs
         let src = "G42 G1 F600 X10\nY10\nX0\nY0\nG40\n";
-        let q = Decoder::decode_program(DecoderConfig::default(), src).unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), src).unwrap();
         let out = ToolRadiusCorrection::new(1.0).process(q).unwrap();
         let m = moves(&out);
         let arcs = m
@@ -619,7 +619,7 @@ mod tests {
         // Full-quadrant CCW arc radius 10 with G41 (left = inside): offset radius 9
         let src = "G41 G1 F600 X0 Y-10\nG3 X10 Y0 I0 J10\nG40\n";
         // start at origin, first move to (0,-10)... keep simple: line then arc
-        let q = Decoder::decode_program(DecoderConfig::default(), src).unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), src).unwrap();
         let out = ToolRadiusCorrection::new(1.0).process(q).unwrap();
         let arc = moves(&out)
             .into_iter()
@@ -635,7 +635,7 @@ mod tests {
     fn gouge_detection() {
         // Tool radius 6 on an inside arc of radius 5 → offset radius ≤ 0
         let src = "G41 G1 F600 X0 Y-5\nG3 X5 Y0 I0 J5\nG40\n";
-        let q = Decoder::decode_program(DecoderConfig::default(), src).unwrap();
+        let q = Decoder::decode_source(DecoderConfig::default(), src).unwrap();
         assert!(ToolRadiusCorrection::new(6.0).process(q).is_err());
     }
 }

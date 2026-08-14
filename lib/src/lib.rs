@@ -36,7 +36,7 @@ pub mod prelude {
     pub use crate::controller::CncController;
     pub use crate::decoder::{Decoder, DecoderConfig};
     pub use crate::driver::{AxisDriver, SimDriver, TrajectoryLog};
-    pub use crate::error::CncError;
+    pub use crate::error::{CncError, DecodeError, GcodeError};
     pub use crate::gcode::lexer::lex;
     pub use crate::geometry::{ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment, SyncEvent};
     pub use crate::interpolator::{Interpolator, IplOutput, IplState};

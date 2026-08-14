@@ -160,7 +160,10 @@ mod tests {
     fn spaces_inside_words_and_block_delete() {
         let blocks = lex("G 0 1 X 1 2 . 5\n/ G1 X99\n").unwrap();
         assert_eq!(blocks.len(), 1);
-        assert_eq!((blocks[0].words[0].letter, blocks[0].words[0].value), ('G', 1.0));
+        assert_eq!(
+            (blocks[0].words[0].letter, blocks[0].words[0].value),
+            ('G', 1.0)
+        );
         assert_eq!(blocks[0].words[1].value, 12.5);
     }
 

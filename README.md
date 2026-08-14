@@ -91,6 +91,30 @@ fn main() -> Result<(), CncError> {
 Runtime control on the interpolator: `set_override(0.4)`, `halt()` / `resume()`,
 `set_single_step(true)` + `step()`.
 
+### Real-time use
+
+`cycle()` allocates a fresh `IplOutput` on every call. In a control loop, keep one buffer
+and refill it — a steady-state cycle (segment boundaries included) then performs **zero**
+heap allocations:
+
+```rust,ignore
+let mut out = cnc.interpolator.output_buffer(); // sized for the loaded program
+loop {
+    cnc.cycle_into(&mut driver, &mut out)?;     // or interpolator.cycle_into(&mut out)
+    if out.state == IplState::Finished { break; }
+}
+```
+
+The planned program's own facts are readable from the interpolator without walking the
+queue: `total_length()`, `start_position()` / `start_aux()` (valid before the first cycle)
+and `current_is_rapid()` (whether the path element under the current output is a `G0`).
+
+Errors keep their pipeline stage: `Decoder::decode_source` reports a lexical failure as
+`CncError::Gcode` and a semantic one as `CncError::Decode`, each with its 1-based source
+line. Nothing reachable through the public API panics — degenerate limits or a degenerate
+cycle time are refused by `Interpolator::load`, which matters on `wasm32-unknown-unknown`
+where a panic is an unrecoverable trap.
+
 ## Examples
 
 Each example writes SVG plots into the working directory:

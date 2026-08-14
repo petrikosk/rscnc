@@ -11,7 +11,7 @@
 //! unit mode, `F` (units/min) is converted to units/s. Auxiliary axis words
 //! are *not* unit-scaled (they are typically rotary degrees).
 
-use crate::error::DecodeError;
+use crate::error::{CncError, DecodeError};
 use crate::gcode::lexer::{lex, ParsedBlock};
 use crate::gcode::program::{DistanceMode, ModalState, MotionMode, TrcMode, Units};
 use crate::geometry::{ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, SyncEvent};
@@ -50,7 +50,7 @@ impl Default for DecoderConfig {
 }
 
 /// The DIN 66025 decoder: turns parsed blocks into geometry queue elements
-/// while tracking modal state. Use [`Decoder::decode_program`] for the
+/// while tracking modal state. Use [`Decoder::decode_source`] for the
 /// common whole-program case.
 pub struct Decoder {
     cfg: DecoderConfig,
@@ -78,9 +78,24 @@ impl Decoder {
         }
     }
 
-    /// Convenience: lex + decode a whole program.
-    pub fn decode_program(cfg: DecoderConfig, source: &str) -> Result<GeoQueue, DecodeError> {
-        let blocks = lex(source).map_err(|e| DecodeError::new(e.line, e.message))?;
+    /// Convenience: lex + decode a whole program, keeping the pipeline stage
+    /// that failed.
+    ///
+    /// A lexical problem comes back as [`CncError::Gcode`] and a semantic one
+    /// as [`CncError::Decode`], each carrying the 1-based source line, so a
+    /// caller can tell "bad token on line N" from "bad block on line N"
+    /// without driving [`lex`] and [`decode_block`](Self::decode_block) by
+    /// hand.
+    ///
+    /// ```
+    /// use rscnc::prelude::*;
+    ///
+    /// let err = Decoder::decode_source(DecoderConfig::default(), "G1 F600 X1\nG1 X#\n")
+    ///     .unwrap_err();
+    /// assert!(matches!(err, CncError::Gcode(ref e) if e.line == 2));
+    /// ```
+    pub fn decode_source(cfg: DecoderConfig, source: &str) -> Result<GeoQueue, CncError> {
+        let blocks = lex(source)?;
         let mut decoder = Decoder::new(cfg);
         let mut queue = GeoQueue::new();
         for block in &blocks {
@@ -90,6 +105,23 @@ impl Decoder {
             }
         }
         Ok(queue)
+    }
+
+    /// Convenience: lex + decode a whole program, reporting every failure as
+    /// a [`DecodeError`].
+    ///
+    /// This flattens lexer errors into decode errors and so loses the stage
+    /// distinction; use [`decode_source`](Self::decode_source) instead.
+    #[deprecated(
+        since = "0.1.1",
+        note = "use `Decoder::decode_source`, which preserves the lex/decode stage distinction"
+    )]
+    pub fn decode_program(cfg: DecoderConfig, source: &str) -> Result<GeoQueue, DecodeError> {
+        Self::decode_source(cfg, source).map_err(|e| match e {
+            CncError::Decode(e) => e,
+            CncError::Gcode(e) => DecodeError::new(e.line, e.message),
+            other => DecodeError::new(0, other.to_string()),
+        })
     }
 
     /// Current modal state (mainly for tests and diagnostics).
@@ -291,7 +323,9 @@ impl Decoder {
             self.state.feed
         };
         if feed <= 0.0 {
-            return Err(err("no feed rate set (F word required before G1/G2/G3)".into()));
+            return Err(err(
+                "no feed rate set (F word required before G1/G2/G3)".into()
+            ));
         }
 
         let geo = match self.state.motion {
@@ -351,7 +385,7 @@ mod tests {
     use crate::geometry::Segment;
 
     fn decode(src: &str) -> GeoQueue {
-        Decoder::decode_program(DecoderConfig::default(), src).unwrap()
+        Decoder::decode_source(DecoderConfig::default(), src).unwrap()
     }
 
     fn moves(q: &GeoQueue) -> Vec<&GeoMove> {
@@ -447,7 +481,7 @@ mod tests {
             start_aux: vec![0.0],
             ..Default::default()
         };
-        let q = Decoder::decode_program(cfg, "G1 F600 X10 A90\nA180\n").unwrap();
+        let q = Decoder::decode_source(cfg, "G1 F600 X10 A90\nA180\n").unwrap();
         let m = moves(&q);
         assert_eq!(m.len(), 2);
         assert_eq!(m[0].aux_end, vec![90.0]);
@@ -463,8 +497,40 @@ mod tests {
             GeoElem::Dwell { seconds, .. } => assert!((seconds - 0.5).abs() < 1e-12),
             _ => panic!(),
         }
-        assert!(Decoder::decode_program(Default::default(), "G1 X10\n").is_err()); // no feed
-        assert!(Decoder::decode_program(Default::default(), "G5 X10\n").is_err()); // unsupported
-        assert!(Decoder::decode_program(Default::default(), "G2 F600 X10 Y10\n").is_err()); // no IJK/R
+        assert!(Decoder::decode_source(Default::default(), "G1 X10\n").is_err()); // no feed
+        assert!(Decoder::decode_source(Default::default(), "G5 X10\n").is_err()); // unsupported
+        assert!(Decoder::decode_source(Default::default(), "G2 F600 X10 Y10\n").is_err());
+        // no IJK/R
+    }
+
+    #[test]
+    fn lex_and_decode_errors_keep_their_stage_and_line() {
+        // Stage 1: the lexer chokes on line 3 ('#' is not a word letter).
+        let lex_err = Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nY5\nX1 #5\n")
+            .unwrap_err();
+        match &lex_err {
+            CncError::Gcode(e) => assert_eq!(e.line, 3, "lex error line: {e}"),
+            other => panic!("expected a G-code (lex) error, got {other:?}"),
+        }
+
+        // Stage 2: the block lexes fine but has no meaning, on line 2.
+        let decode_err =
+            Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nG5 X1\n").unwrap_err();
+        match &decode_err {
+            CncError::Decode(e) => assert_eq!(e.line, 2, "decode error line: {e}"),
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+
+        // The two stages are distinguishable, which is the whole point.
+        assert_ne!(
+            core::mem::discriminant(&lex_err),
+            core::mem::discriminant(&decode_err)
+        );
+
+        // An unterminated comment is a lex error too, on its own line.
+        let comment_err =
+            Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nX1 (oops\n")
+                .unwrap_err();
+        assert!(matches!(comment_err, CncError::Gcode(e) if e.line == 2));
     }
 }

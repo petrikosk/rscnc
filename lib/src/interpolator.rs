@@ -22,6 +22,27 @@ const EPS_V: f64 = 1e-9;
 /// Override values below this snap to 0 (a slower crawl would produce
 /// trajectory durations beyond rsruckig's supported range).
 const MIN_OVERRIDE: f64 = 0.005;
+/// Event slots pre-reserved in [`Interpolator::output_buffer`].
+const EVENT_CAPACITY: usize = 4;
+
+/// Non-panicking rsruckig error handler.
+///
+/// Every rsruckig problem is returned as `Err` and converted into
+/// [`CncError::Otg`]; rscnc never installs a handler that panics or aborts,
+/// because on `wasm32-unknown-unknown` a panic is an unrecoverable trap and
+/// there is no unwinding to recover from it.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReturnErrorHandler;
+
+impl RuckigErrorHandler for ReturnErrorHandler {
+    fn handle_validation_error(message: &str) -> Result<(), RuckigError> {
+        Err(RuckigError::ValidationError(message.to_string()))
+    }
+
+    fn handle_calculator_error(message: &str) -> Result<(), RuckigError> {
+        Err(RuckigError::CalculatorError(message.to_string()))
+    }
+}
 
 /// Interpolator state (the `SMC_INT_STATUS` analogue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,7 +65,12 @@ pub enum IplState {
 }
 
 /// Per-cycle interpolator output.
-#[derive(Debug, Clone)]
+///
+/// For real-time use do not build one per cycle: create a single buffer with
+/// [`Interpolator::output_buffer`] and fill it with
+/// [`Interpolator::cycle_into`], which reuses the buffer's existing capacity
+/// and performs no heap allocation in steady state.
+#[derive(Debug, Clone, Default)]
 pub struct IplOutput {
     /// Interpolator state after this cycle.
     pub state: IplState,
@@ -72,6 +98,22 @@ pub struct IplOutput {
     pub progress: f64,
 }
 
+impl IplOutput {
+    /// An empty output with room for `n_aux` auxiliary axes and a few
+    /// synchronized events, so that filling it never has to allocate.
+    ///
+    /// [`Interpolator::output_buffer`] sizes this from the loaded program and
+    /// is normally the better choice.
+    pub fn with_aux_capacity(n_aux: usize) -> Self {
+        Self {
+            aux: Vec::with_capacity(n_aux),
+            aux_velocity: Vec::with_capacity(n_aux),
+            events: Vec::with_capacity(EVENT_CAPACITY),
+            ..Self::default()
+        }
+    }
+}
+
 /// The path interpolator. [`load`](Self::load) a planned queue, then call
 /// [`cycle`](Self::cycle) every control period; runtime control via
 /// [`set_override`](Self::set_override), [`halt`](Self::halt) /
@@ -88,7 +130,7 @@ pub struct Interpolator {
     plan_pos: usize,
     total_length: f64,
 
-    otg: Ruckig<1, ThrowErrorHandler>,
+    otg: Ruckig<1, ReturnErrorHandler>,
     input: InputParameter<1>,
     traj: Trajectory<1>,
     traj_time: f64,
@@ -114,6 +156,9 @@ pub struct Interpolator {
     tangent: PathPoint,
     aux_now: Vec<f64>,
     aux_vel_now: Vec<f64>,
+    /// Worst-case auxiliary axis count of the loaded program; the aux buffers
+    /// are reserved for it at load time so the cycle never grows them.
+    aux_capacity: usize,
     pending_events: Vec<SyncEvent>,
     last_src_line: usize,
     last_obj_no: u32,
@@ -161,7 +206,8 @@ impl Interpolator {
             tangent: [0.0; 3],
             aux_now: Vec::new(),
             aux_vel_now: Vec::new(),
-            pending_events: Vec::new(),
+            aux_capacity: 0,
+            pending_events: Vec::with_capacity(EVENT_CAPACITY),
             last_src_line: 0,
             last_obj_no: 0,
         }
@@ -170,8 +216,19 @@ impl Interpolator {
     /// Load a (preprocessed) queue and run the look-ahead plan over it.
     /// Resets all runtime state; interpolation starts from rest at the
     /// first move's start point.
+    ///
+    /// The cycle time and the path limits are validated here: a degenerate
+    /// configuration (non-finite, zero or negative cycle time / velocity /
+    /// acceleration / jerk) is refused with [`CncError::Interpolator`]
+    /// instead of being handed to the trajectory generator.
+    ///
+    /// All per-cycle buffers are sized for the loaded program here, so a
+    /// steady-state [`cycle_into`](Self::cycle_into) allocates nothing.
     pub fn load(&mut self, queue: GeoQueue) -> Result<(), CncError> {
-        self.plan = self.lookahead.plan(&queue, &self.limits, &self.aux_max_velocity);
+        self.check_config()?;
+        self.plan = self
+            .lookahead
+            .plan(&queue, &self.limits, &self.aux_max_velocity);
         self.queue = queue.into_iter().collect();
         self.total_length = self.plan.iter().map(|p| p.length).sum();
         self.cursor = 0;
@@ -184,28 +241,45 @@ impl Interpolator {
         self.traj_time = 0.0;
         self.step_pending = false;
         self.pending_events.clear();
+        // Worst-case aux width of the program: the per-cycle buffers are
+        // reserved for it once, here, and never grow again.
+        self.aux_capacity = self
+            .queue
+            .iter()
+            .filter_map(|e| match e {
+                GeoElem::Move(m) => Some(m.aux_start.len().max(m.aux_end.len())),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let mut aux = core::mem::take(&mut self.aux_now);
+        let mut aux_vel = core::mem::take(&mut self.aux_vel_now);
+        aux.clear();
+        aux_vel.clear();
+        aux.reserve(self.aux_capacity);
+        aux_vel.reserve(self.aux_capacity);
         // Initial pose from the first move
-        if let Some(mv) = self.queue.iter().find_map(|e| match e {
-            GeoElem::Move(m) => Some(m),
-            _ => None,
-        }) {
-            self.point = mv.geo.start();
-            self.tangent = [0.0; 3];
-            self.aux_now = mv.aux_start.clone();
-            self.aux_vel_now = vec![0.0; mv.aux_start.len()];
+        let point = if let Some(mv) = self.first_move() {
+            aux.extend_from_slice(&mv.aux_start);
+            aux_vel.resize(mv.aux_start.len(), 0.0);
+            mv.geo.start()
         } else {
-            self.point = [0.0; 3];
-            self.tangent = [0.0; 3];
-        }
+            [0.0; 3]
+        };
+        self.aux_now = aux;
+        self.aux_vel_now = aux_vel;
+        self.point = point;
+        self.tangent = [0.0; 3];
         self.state = IplState::Running; // enter_next refines this
         self.enter_next(self.effective_override())?;
         Ok(())
     }
 
     /// Feed override factor (1.0 = 100%). Values below 0.5% snap to 0,
-    /// which decelerates to a pause; raising it again resumes.
+    /// which decelerates to a pause; raising it again resumes. A NaN factor
+    /// is treated as 0 (pause) rather than propagated into the trajectory.
     pub fn set_override(&mut self, factor: f64) {
-        self.override_pct = if factor < MIN_OVERRIDE { 0.0 } else { factor };
+        self.override_pct = if factor >= MIN_OVERRIDE { factor } else { 0.0 };
     }
 
     /// The current feed override factor.
@@ -244,6 +318,84 @@ impl Interpolator {
         self.cycle_time
     }
 
+    /// Total parameter length of the loaded program (the sum of all planned
+    /// segment lengths, i.e. the denominator of
+    /// [`IplOutput::progress`](IplOutput#structfield.progress)). 0 before a
+    /// program is loaded.
+    pub fn total_length(&self) -> f64 {
+        self.total_length
+    }
+
+    /// Start point of the loaded path: the start of the program's first move,
+    /// available immediately after [`load`](Self::load) and before the first
+    /// cycle. `[0, 0, 0]` when the program contains no move.
+    pub fn start_position(&self) -> PathPoint {
+        self.first_move().map_or([0.0; 3], |mv| mv.geo.start())
+    }
+
+    /// Auxiliary axis positions at the start of the loaded path, in decoder
+    /// order. Empty when the program contains no move.
+    pub fn start_aux(&self) -> &[f64] {
+        self.first_move().map_or(&[][..], |mv| &mv.aux_start)
+    }
+
+    /// Whether the path element the current output belongs to is a rapid
+    /// (`G0`) move. Valid immediately after [`cycle`](Self::cycle) /
+    /// [`cycle_into`](Self::cycle_into) — it refers to the same move the
+    /// output pose was produced from — and after [`load`](Self::load) it
+    /// refers to the program's first move. `false` when no move is loaded.
+    pub fn current_is_rapid(&self) -> bool {
+        self.current_or_last_move().is_some_and(|mv| mv.is_rapid)
+    }
+
+    /// Reject a degenerate configuration before it reaches rsruckig.
+    fn check_config(&self) -> Result<(), CncError> {
+        let bad = |what: &str, v: f64| {
+            Err(CncError::Interpolator(format!(
+                "{what} must be a finite number greater than zero (got {v})"
+            )))
+        };
+        if !self.cycle_time.is_finite() || self.cycle_time <= 0.0 {
+            return bad("cycle time", self.cycle_time);
+        }
+        if !self.limits.max_velocity.is_finite() || self.limits.max_velocity <= 0.0 {
+            return bad("max_velocity", self.limits.max_velocity);
+        }
+        if !self.limits.max_acceleration.is_finite() || self.limits.max_acceleration <= 0.0 {
+            return bad("max_acceleration", self.limits.max_acceleration);
+        }
+        if !self.limits.max_jerk.is_finite() || self.limits.max_jerk <= 0.0 {
+            return bad("max_jerk", self.limits.max_jerk);
+        }
+        let a_n = self.limits.max_normal_acceleration;
+        if !a_n.is_finite() || a_n < 0.0 {
+            return Err(CncError::Interpolator(format!(
+                "max_normal_acceleration must be a finite number greater than or equal to zero (got {a_n})"
+            )));
+        }
+        if let Some((i, v)) = self
+            .aux_max_velocity
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite() || **v < 0.0)
+        {
+            return Err(CncError::Interpolator(format!(
+                "auxiliary axis {i} velocity limit must be a finite number greater than or equal to zero (got {v})"
+            )));
+        }
+        if !self.lookahead.accel_margin.is_finite()
+            || self.lookahead.accel_margin <= 0.0
+            || !self.lookahead.junction_deviation.is_finite()
+            || self.lookahead.junction_deviation < 0.0
+        {
+            return Err(CncError::Interpolator(format!(
+                "look-ahead parameters are degenerate (accel_margin {}, junction_deviation {})",
+                self.lookahead.accel_margin, self.lookahead.junction_deviation
+            )));
+        }
+        Ok(())
+    }
+
     fn effective_override(&self) -> f64 {
         if self.halted {
             0.0
@@ -252,8 +404,44 @@ impl Interpolator {
         }
     }
 
-    /// Advance one control cycle.
+    /// Advance one control cycle, returning a freshly allocated output.
+    ///
+    /// This is a convenience wrapper around [`cycle_into`](Self::cycle_into);
+    /// it allocates the output's `aux`, `aux_velocity` and `events` vectors on
+    /// every call. Real-time callers should keep one buffer from
+    /// [`output_buffer`](Self::output_buffer) and use `cycle_into`.
     pub fn cycle(&mut self) -> Result<IplOutput, CncError> {
+        let mut out = IplOutput::with_aux_capacity(self.aux_capacity);
+        self.cycle_into(&mut out)?;
+        Ok(out)
+    }
+
+    /// Advance one control cycle, writing the result into an existing output
+    /// buffer.
+    ///
+    /// The buffer's vectors are cleared and refilled, reusing their capacity:
+    /// with a buffer from [`output_buffer`](Self::output_buffer) a
+    /// steady-state cycle — segment boundaries included — performs **zero**
+    /// heap allocations. (A cycle that emits synchronized events still
+    /// allocates for the event payloads themselves.)
+    ///
+    /// On error the buffer is left untouched.
+    pub fn cycle_into(&mut self, out: &mut IplOutput) -> Result<(), CncError> {
+        self.advance()?;
+        self.fill_output(out);
+        Ok(())
+    }
+
+    /// A per-cycle output buffer sized for the loaded program and seeded with
+    /// the current (after [`load`](Self::load): the start) pose, so the first
+    /// [`cycle_into`](Self::cycle_into) has nothing left to allocate.
+    pub fn output_buffer(&self) -> IplOutput {
+        let mut out = IplOutput::with_aux_capacity(self.aux_capacity);
+        self.seed_output(&mut out);
+        out
+    }
+
+    fn advance(&mut self) -> Result<(), CncError> {
         self.time += self.cycle_time;
         let ovr = self.effective_override();
 
@@ -315,10 +503,17 @@ impl Interpolator {
             _ => {}
         }
 
-        Ok(self.make_output())
+        Ok(())
     }
 
     // --- internals -------------------------------------------------------
+
+    fn first_move(&self) -> Option<&GeoMove> {
+        self.queue.iter().find_map(|e| match e {
+            GeoElem::Move(m) => Some(m),
+            _ => None,
+        })
+    }
 
     fn current_move(&self) -> Option<&GeoMove> {
         match self.queue.get(self.cursor) {
@@ -522,10 +717,8 @@ impl Interpolator {
             if s <= seg_len {
                 break;
             }
-            let next_is_adjacent_move = matches!(
-                self.queue.get(self.cursor + 1),
-                Some(GeoElem::Move(_))
-            );
+            let next_is_adjacent_move =
+                matches!(self.queue.get(self.cursor + 1), Some(GeoElem::Move(_)));
             if !next_is_adjacent_move {
                 // Should not happen (v_exit = 0 before non-move elements
                 // guarantees the stop fits), but never leave the segment.
@@ -550,39 +743,48 @@ impl Interpolator {
     }
 
     /// Update path point, tangent and aux values from `s_local`.
+    ///
+    /// The aux buffers are taken out of `self`, refilled in place and put
+    /// back, so no allocation happens as long as their capacity (reserved in
+    /// [`load`](Self::load)) covers the move's aux width.
     fn update_pose(&mut self) {
         let v_s = self.v_s;
         let s_local = self.s_local;
-        let Some(mv) = self.current_or_last_move() else {
-            return;
-        };
-        let param_len = mv.param_length();
-        let s = s_local.clamp(0.0, param_len);
-        let geo_len = mv.geo.length();
-        let s_geo = s.min(geo_len);
-        let point = mv.geo.point_at(s_geo);
-        let tangent = if geo_len > 0.0 {
-            mv.geo.tangent_at(s_geo)
-        } else {
-            [0.0; 3]
-        };
-        let u = if param_len > 0.0 { s / param_len } else { 1.0 };
-        let n_aux = mv.aux_start.len();
-        let mut aux_now = vec![0.0; n_aux];
-        let mut aux_vel_now = vec![0.0; n_aux];
-        for i in 0..n_aux {
-            let delta = mv.aux_end[i] - mv.aux_start[i];
-            aux_now[i] = mv.aux_start[i] + delta * u;
-            aux_vel_now[i] = if param_len > 0.0 {
-                delta / param_len * v_s
+        let mut aux = core::mem::take(&mut self.aux_now);
+        let mut aux_vel = core::mem::take(&mut self.aux_vel_now);
+
+        let pose = self.current_or_last_move().map(|mv| {
+            let param_len = mv.param_length();
+            let s = s_local.clamp(0.0, param_len);
+            let geo_len = mv.geo.length();
+            let s_geo = s.min(geo_len);
+            let point = mv.geo.point_at(s_geo);
+            let tangent = if geo_len > 0.0 {
+                mv.geo.tangent_at(s_geo)
             } else {
-                0.0
+                [0.0; 3]
             };
+            let u = if param_len > 0.0 { s / param_len } else { 1.0 };
+            aux.clear();
+            aux_vel.clear();
+            for (a0, a1) in mv.aux_start.iter().zip(mv.aux_end.iter()) {
+                let delta = a1 - a0;
+                aux.push(a0 + delta * u);
+                aux_vel.push(if param_len > 0.0 {
+                    delta / param_len * v_s
+                } else {
+                    0.0
+                });
+            }
+            (point, tangent)
+        });
+
+        self.aux_now = aux;
+        self.aux_vel_now = aux_vel;
+        if let Some((point, tangent)) = pose {
+            self.point = point;
+            self.tangent = tangent;
         }
-        self.point = point;
-        self.tangent = tangent;
-        self.aux_now = aux_now;
-        self.aux_vel_now = aux_vel_now;
     }
 
     fn current_or_last_move(&self) -> Option<&GeoMove> {
@@ -599,24 +801,33 @@ impl Interpolator {
             })
     }
 
-    fn make_output(&mut self) -> IplOutput {
-        IplOutput {
-            state: self.state,
-            path_position: self.point,
-            path_tangent: self.tangent,
-            path_velocity: self.v_s,
-            path_acceleration: self.a_s,
-            aux: self.aux_now.clone(),
-            aux_velocity: self.aux_vel_now.clone(),
-            events: core::mem::take(&mut self.pending_events),
-            src_line: self.last_src_line,
-            obj_no: self.last_obj_no,
-            s_total: self.s_done + self.s_local,
-            progress: if self.total_length > 0.0 {
-                ((self.s_done + self.s_local) / self.total_length).min(1.0)
-            } else {
-                1.0
-            },
-        }
+    /// Copy the current state (everything but the pending events) into `out`,
+    /// reusing the buffer's capacity.
+    fn seed_output(&self, out: &mut IplOutput) {
+        out.state = self.state;
+        out.path_position = self.point;
+        out.path_tangent = self.tangent;
+        out.path_velocity = self.v_s;
+        out.path_acceleration = self.a_s;
+        out.aux.clear();
+        out.aux.extend_from_slice(&self.aux_now);
+        out.aux_velocity.clear();
+        out.aux_velocity.extend_from_slice(&self.aux_vel_now);
+        out.src_line = self.last_src_line;
+        out.obj_no = self.last_obj_no;
+        out.s_total = self.s_done + self.s_local;
+        out.progress = if self.total_length > 0.0 {
+            (out.s_total / self.total_length).min(1.0)
+        } else {
+            1.0
+        };
+    }
+
+    fn fill_output(&mut self, out: &mut IplOutput) {
+        self.seed_output(out);
+        // Hand over the events crossed this cycle without dropping either
+        // vector's capacity.
+        out.events.clear();
+        out.events.append(&mut self.pending_events);
     }
 }

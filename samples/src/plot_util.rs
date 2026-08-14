@@ -73,7 +73,11 @@ fn draw(
     series: &[Series],
     equal_aspect: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (w, h) = if equal_aspect { (900, 900) } else { (1280, 768) };
+    let (w, h) = if equal_aspect {
+        (900, 900)
+    } else {
+        (1280, 768)
+    };
     let root = SVGBackend::new(path, (w, h)).into_drawing_area();
     root.fill(&WHITE)?;
 
