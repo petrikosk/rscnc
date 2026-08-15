@@ -11,7 +11,7 @@
 //! halt) and resume simply retarget the profile from the current state.
 
 use crate::error::CncError;
-use crate::geometry::{GeoElem, GeoMove, Segment, SyncEvent};
+use crate::geometry::{GeoElem, GeoMove, Segment, SwitchPoint, SyncEvent};
 use crate::lookahead::{LookAhead, PlannedSegment};
 use crate::queue::GeoQueue;
 use crate::types::{PathLimits, PathPoint};
@@ -88,6 +88,9 @@ pub struct IplOutput {
     pub aux_velocity: Vec<f64>,
     /// Synchronized events crossed during this cycle.
     pub events: Vec<SyncEvent>,
+    /// Switch points (`H` functions) crossed during this cycle, in the order
+    /// they were passed.
+    pub switch_points: Vec<SwitchPoint>,
     /// Source line of the current (or last) move.
     pub src_line: usize,
     /// Object number of the current (or last) move.
@@ -105,10 +108,17 @@ impl IplOutput {
     /// [`Interpolator::output_buffer`] sizes this from the loaded program and
     /// is normally the better choice.
     pub fn with_aux_capacity(n_aux: usize) -> Self {
+        Self::with_capacity(n_aux, EVENT_CAPACITY)
+    }
+
+    /// An empty output with room for `n_aux` auxiliary axes and `n_switch`
+    /// switch points, so that filling it never has to allocate.
+    pub fn with_capacity(n_aux: usize, n_switch: usize) -> Self {
         Self {
             aux: Vec::with_capacity(n_aux),
             aux_velocity: Vec::with_capacity(n_aux),
             events: Vec::with_capacity(EVENT_CAPACITY),
+            switch_points: Vec::with_capacity(n_switch),
             ..Self::default()
         }
     }
@@ -160,6 +170,11 @@ pub struct Interpolator {
     /// are reserved for it at load time so the cycle never grows them.
     aux_capacity: usize,
     pending_events: Vec<SyncEvent>,
+    /// Switch points crossed since the last output, and how far into the
+    /// current move's list the interpolator has already reported.
+    pending_switches: Vec<SwitchPoint>,
+    switch_pos: usize,
+    switch_capacity: usize,
     last_src_line: usize,
     last_obj_no: u32,
 }
@@ -208,6 +223,9 @@ impl Interpolator {
             aux_vel_now: Vec::new(),
             aux_capacity: 0,
             pending_events: Vec::with_capacity(EVENT_CAPACITY),
+            pending_switches: Vec::with_capacity(EVENT_CAPACITY),
+            switch_pos: 0,
+            switch_capacity: EVENT_CAPACITY,
             last_src_line: 0,
             last_obj_no: 0,
         }
@@ -241,6 +259,20 @@ impl Interpolator {
         self.traj_time = 0.0;
         self.step_pending = false;
         self.pending_events.clear();
+        self.pending_switches.clear();
+        self.switch_pos = 0;
+        // Worst case for one cycle: every switch point of the busiest move.
+        self.switch_capacity = self
+            .queue
+            .iter()
+            .filter_map(|e| match e {
+                GeoElem::Move(m) => Some(m.switch_points.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .max(EVENT_CAPACITY);
+        self.pending_switches.reserve(self.switch_capacity);
         // Worst-case aux width of the program: the per-cycle buffers are
         // reserved for it once, here, and never grow again.
         self.aux_capacity = self
@@ -411,7 +443,7 @@ impl Interpolator {
     /// every call. Real-time callers should keep one buffer from
     /// [`output_buffer`](Self::output_buffer) and use `cycle_into`.
     pub fn cycle(&mut self) -> Result<IplOutput, CncError> {
-        let mut out = IplOutput::with_aux_capacity(self.aux_capacity);
+        let mut out = IplOutput::with_capacity(self.aux_capacity, self.switch_capacity);
         self.cycle_into(&mut out)?;
         Ok(out)
     }
@@ -436,7 +468,7 @@ impl Interpolator {
     /// the current (after [`load`](Self::load): the start) pose, so the first
     /// [`cycle_into`](Self::cycle_into) has nothing left to allocate.
     pub fn output_buffer(&self) -> IplOutput {
-        let mut out = IplOutput::with_aux_capacity(self.aux_capacity);
+        let mut out = IplOutput::with_capacity(self.aux_capacity, self.switch_capacity);
         self.seed_output(&mut out);
         out
     }
@@ -558,6 +590,7 @@ impl Interpolator {
                     debug_assert_eq!(self.plan[self.plan_pos].queue_index, self.cursor);
                     self.s_local = 0.0;
                     self.a_s = 0.0;
+                    self.switch_pos = 0;
                     if self.single_step {
                         self.v_s = 0.0;
                         self.state = IplState::StepHold;
@@ -593,7 +626,7 @@ impl Interpolator {
         // reachable in the remaining distance (prevents the time-optimal
         // profile from backing up to get a run-up).
         let remaining = (seg.length - self.s_local).max(0.0);
-        let a_eff = self.limits.max_acceleration * self.lookahead.accel_margin;
+        let a_eff = seg.accel * self.lookahead.accel_margin;
         let reachable = (self.v_s * self.v_s + 2.0 * a_eff * remaining).sqrt();
         let mut v_exit = seg.v_exit.min(v_max).min(reachable);
         if self.single_step {
@@ -608,7 +641,7 @@ impl Interpolator {
         self.input.target_velocity[0] = v_exit;
         self.input.target_acceleration[0] = 0.0;
         self.input.max_velocity[0] = v_max.max(v_exit);
-        self.input.max_acceleration[0] = self.limits.max_acceleration;
+        self.set_accel_limits(seg.accel, seg.decel);
         self.input.max_jerk[0] = self.limits.max_jerk;
 
         self.calculate(src_line)?;
@@ -621,16 +654,41 @@ impl Interpolator {
     /// (velocity control interface; position is unconstrained).
     fn plan_stop_traj(&mut self) -> Result<(), CncError> {
         let src_line = self.last_src_line;
+        let decel = self.current_decel();
         self.input.control_interface = ControlInterface::Velocity;
         self.input.current_position[0] = self.s_local;
         self.input.current_velocity[0] = self.v_s;
         self.input.current_acceleration[0] = self.a_s;
         self.input.target_velocity[0] = 0.0;
         self.input.target_acceleration[0] = 0.0;
-        self.input.max_acceleration[0] = self.limits.max_acceleration;
+        // Braking to a stop: the deceleration limit is the binding one, and
+        // the velocity interface reads it from `max_acceleration`.
+        self.set_accel_limits(decel, decel);
         self.input.max_jerk[0] = self.limits.max_jerk;
         self.stop_s_offset = 0.0;
         self.calculate(src_line)
+    }
+
+    /// The deceleration limit in force where the path currently is.
+    fn current_decel(&self) -> f64 {
+        self.plan
+            .get(self.plan_pos)
+            .map_or(self.limits.max_acceleration, |p| p.decel)
+    }
+
+    /// Hand rsruckig this segment's acceleration and deceleration limits.
+    /// Symmetric limits stay on the plain `max_acceleration` path; an `E`
+    /// word that separates them sets `min_acceleration` as well.
+    fn set_accel_limits(&mut self, accel: f64, decel: f64) {
+        self.input.max_acceleration[0] = accel;
+        if (accel - decel).abs() <= f64::EPSILON * accel.max(decel) {
+            self.input.min_acceleration = None;
+        } else {
+            match &mut self.input.min_acceleration {
+                Some(v) => v[0] = -decel,
+                slot => *slot = Some(daov_stack![-decel]),
+            }
+        }
     }
 
     fn calculate(&mut self, src_line: usize) -> Result<(), CncError> {
@@ -679,6 +737,7 @@ impl Interpolator {
             self.v_s = self.planned_v_exit;
             self.a_s = 0.0;
             self.update_pose();
+            self.fire_switches(f64::INFINITY);
             self.s_done += seg.length;
             self.s_local = 0.0;
             self.cursor += 1;
@@ -697,6 +756,7 @@ impl Interpolator {
         self.v_s = v.max(0.0);
         self.a_s = a;
         self.update_pose();
+        self.fire_switches(self.s_local);
         Ok(())
     }
 
@@ -725,14 +785,17 @@ impl Interpolator {
                 s = seg_len;
                 break;
             }
+            self.fire_switches(f64::INFINITY);
             s -= seg_len;
             self.stop_s_offset += seg_len;
             self.s_done += seg_len;
             self.cursor += 1;
             self.plan_pos += 1;
+            self.switch_pos = 0;
         }
         self.s_local = s;
         self.update_pose();
+        self.fire_switches(self.s_local);
 
         if self.traj_time >= duration || self.v_s <= EPS_V {
             self.v_s = 0.0;
@@ -740,6 +803,23 @@ impl Interpolator {
             self.state = IplState::Paused;
         }
         Ok(())
+    }
+
+    /// Report every switch point of the current move up to path position `s`
+    /// that has not been reported yet. `f64::INFINITY` drains the move's list,
+    /// which is what leaving the element does.
+    fn fire_switches(&mut self, s: f64) {
+        let mut fired = core::mem::take(&mut self.pending_switches);
+        if let Some(GeoElem::Move(mv)) = self.queue.get(self.cursor) {
+            while let Some(sp) = mv.switch_points.get(self.switch_pos) {
+                if sp.position > s {
+                    break;
+                }
+                fired.push(*sp);
+                self.switch_pos += 1;
+            }
+        }
+        self.pending_switches = fired;
     }
 
     /// Update path point, tangent and aux values from `s_local`.
@@ -829,5 +909,7 @@ impl Interpolator {
         // vector's capacity.
         out.events.clear();
         out.events.append(&mut self.pending_events);
+        out.switch_points.clear();
+        out.switch_points.append(&mut self.pending_switches);
     }
 }

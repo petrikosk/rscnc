@@ -59,16 +59,17 @@ fn disarm() -> usize {
     ALLOCATIONS.with(Cell::get)
 }
 
-/// A zigzag with one auxiliary axis: short segments, so the measured window
-/// crosses many segment boundaries (where the interpolator replans).
+/// A zigzag with one auxiliary axis and two switch points per element: short
+/// segments, so the measured window crosses many segment boundaries (where the
+/// interpolator replans) and reports switch points along the way.
 fn program() -> String {
-    let mut src = String::from("G1 F600\n");
+    let mut src = String::from("G1 F10\n");
     let (mut x, mut a) = (0.0f64, 0.0f64);
     for i in 0..80 {
         x += 2.0;
         let y = if i % 2 == 0 { 2.0 } else { 0.0 };
         a += 1.0;
-        src.push_str(&format!("X{x:.3} Y{y:.3} A{a:.3}\n"));
+        src.push_str(&format!("X{x:.3} Y{y:.3} A{a:.3} H1 O0.25 H-1 O0.75\n"));
     }
     src
 }
@@ -112,12 +113,14 @@ fn steady_state_cycle_with_aux_axes_never_allocates() {
     );
 
     let mut boundaries = 0;
+    let mut switches = 0;
     let mut last_obj = out.obj_no;
     let mut finished = false;
 
     arm();
     for _ in 0..2000 {
         ipl.cycle_into(&mut out).expect("cycle");
+        switches += out.switch_points.len();
         if out.obj_no != last_obj {
             last_obj = out.obj_no;
             boundaries += 1;
@@ -142,4 +145,5 @@ fn steady_state_cycle_with_aux_axes_never_allocates() {
         "expected the measured window to cross segment boundaries, saw {boundaries}"
     );
     assert!(out.aux[0] > 0.0, "the aux axis did not move");
+    assert!(switches > 0, "no switch point was reported in the window");
 }

@@ -90,10 +90,49 @@ pub struct GeoMove {
     pub aux_end: Vec<f64>,
     /// Tool radius correction mode active for this move.
     pub trc: TrcMode,
+    /// Programmed path acceleration limit for this move (internal units/s²)
+    /// from an `E` word; `None` leaves the machine limit as the only bound.
+    pub accel: Option<f64>,
+    /// Programmed path deceleration limit for this move (internal units/s²,
+    /// a positive magnitude) from a negative `E` word.
+    pub decel: Option<f64>,
+    /// Switch points (`H` functions) programmed on this move, sorted by
+    /// position along the element.
+    pub switch_points: Vec<SwitchPoint>,
     /// 1-based source line the move was programmed on.
     pub src_line: usize,
     /// Monotone object number (the `SMC_GEOINFO.iObjNo` analogue).
     pub obj_no: u32,
+}
+
+/// A switch point on a path element: the DIN 66025 `H` function, positioned
+/// with `L` (absolute distance from the element's start, or from its end when
+/// negative) or `O` (relative position in `[0, 1]`).
+///
+/// The interpolator reports one as it crosses it, so the application can
+/// drive an output in sync with the path rather than with the block boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SwitchPoint {
+    /// Programmed `H` number: positive switches the function on, negative off.
+    pub number: i32,
+    /// Distance from the start of the path element, internal units.
+    pub position: f64,
+    /// 1-based source line the switch point was programmed on.
+    pub src_line: usize,
+}
+
+impl SwitchPoint {
+    /// The switch function's number, without the on/off sign.
+    #[inline]
+    pub fn id(&self) -> u32 {
+        self.number.unsigned_abs()
+    }
+
+    /// `true` when the point switches its function on (a positive `H`).
+    #[inline]
+    pub fn is_on(&self) -> bool {
+        self.number > 0
+    }
 }
 
 impl GeoMove {
@@ -112,17 +151,46 @@ impl GeoMove {
             .map(|(a, b)| (b - a).abs())
             .fold(0.0, f64::max)
     }
+
+    /// Move the switch points of an element whose start was cut back by
+    /// `shift` and which is now `new_length` long (corner rounding). Positions
+    /// keep their distance to the geometry that survives; a point inside the
+    /// removed piece lands on the new element boundary rather than vanishing.
+    pub fn shift_switch_points(&mut self, shift: f64, new_length: f64) {
+        let end = new_length.max(0.0);
+        for sp in &mut self.switch_points {
+            sp.position = (sp.position - shift).clamp(0.0, end);
+        }
+    }
+
+    /// Map the switch points onto a replacement element of a different length
+    /// (tool radius correction offsets an element in parallel, so the relative
+    /// position along it is what stays meaningful).
+    pub fn scale_switch_points(&mut self, old_length: f64, new_length: f64) {
+        if self.switch_points.is_empty() {
+            return;
+        }
+        let factor = if old_length > 1e-12 {
+            new_length / old_length
+        } else {
+            0.0
+        };
+        for sp in &mut self.switch_points {
+            sp.position = (sp.position * factor).clamp(0.0, new_length.max(0.0));
+        }
+    }
 }
 
 /// A synchronized event fired when the path crosses its queue position
-/// (M functions with optional H parameter, spindle and tool changes).
-/// In v1 events force an exact stop at their queue position.
+/// (M functions, spindle and tool changes). In v1 events force an exact stop
+/// at their queue position.
+///
+/// `H` functions are *not* events: they are positioned inside a path element
+/// and reported as [`SwitchPoint`]s while the interpolator crosses them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncEvent {
     /// M function numbers in programmed order.
     pub m: Vec<u32>,
-    /// H parameter accompanying the M functions, if any.
-    pub h: Option<f64>,
     /// New spindle speed from an S word, if any.
     pub spindle: Option<f64>,
     /// New tool from a T word, if any.
@@ -155,6 +223,15 @@ impl GeoElem {
             GeoElem::Dwell { src_line, .. } => *src_line,
             GeoElem::Event(e) => e.src_line,
         }
+    }
+}
+
+/// The tighter of two optional limits, where `None` means "unbounded".
+pub(crate) fn min_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
     }
 }
 

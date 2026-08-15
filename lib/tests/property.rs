@@ -79,7 +79,7 @@ proptest! {
     #[test]
     fn random_polyline(
         raw_pts in prop::collection::vec((-30.0..30.0f64, -30.0..30.0f64), 1..7),
-        feed in 600.0..3000.0f64,
+        feed in 5.0..50.0f64,
     ) {
         // Round to the precision written into the program text, so the
         // assertions compare against what was actually programmed
@@ -119,7 +119,7 @@ proptest! {
         radius in 2.0..40.0f64,
         sweep_frac in 0.05..0.95f64,
         ccw in any::<bool>(),
-        raw_feed in 600.0..3000.0f64,
+        raw_feed in 5.0..50.0f64,
     ) {
         // Match the precision written into the program text
         let feed = (raw_feed * 1e3).round() / 1e3;
@@ -150,7 +150,7 @@ proptest! {
         // Curvature cap honored
         let v_cap = (limits().max_normal_acceleration * radius)
             .sqrt()
-            .min(feed / 60.0)
+            .min(feed)
             .min(limits().max_velocity);
         let v_max_seen = outputs.iter().map(|o| o.path_velocity).fold(0.0, f64::max);
         prop_assert!(v_max_seen <= v_cap + 1e-6, "v {} > cap {}", v_max_seen, v_cap);

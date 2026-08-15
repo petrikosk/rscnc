@@ -15,7 +15,7 @@
 use super::Preprocessor;
 use crate::error::PreprocessError;
 use crate::gcode::TrcMode;
-use crate::geometry::{ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment};
+use crate::geometry::{min_opt, ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment};
 use crate::queue::GeoQueue;
 use crate::types::{PathPoint, WorkPlane};
 
@@ -228,9 +228,14 @@ impl ToolRadiusCorrection {
                     })
                 }
             };
+            // The offset element runs parallel to the programmed one but is a
+            // different length; a switch point keeps its relative place on it.
+            let (old_len, new_len) = (mv.geo.length(), geo.length());
+            let mut offset_mv = GeoMove { geo, ..mv.clone() };
+            offset_mv.scale_switch_points(old_len, new_len);
             off.push(Tagged {
                 src: k,
-                mv: GeoMove { geo, ..mv.clone() },
+                mv: offset_mv,
             });
         }
         if off.is_empty() {
@@ -275,6 +280,9 @@ impl ToolRadiusCorrection {
                         aux_start: corner_src.aux_end.clone(),
                         aux_end: corner_src.aux_end.clone(),
                         trc: mode,
+                        accel: min_opt(corner_src.accel, chain[next.src].accel),
+                        decel: min_opt(corner_src.decel, chain[next.src].decel),
+                        switch_points: Vec::new(),
                         src_line: corner_src.src_line,
                         obj_no: corner_src.obj_no,
                     },
@@ -294,8 +302,13 @@ impl ToolRadiusCorrection {
                 let src_line = corner_src.src_line;
                 trim_end(&mut joined[prev_idx].mv.geo, pt, plane, normal_coord)
                     .map_err(|e| gouge(src_line, e))?;
+                let trimmed_len = joined[prev_idx].mv.geo.length();
+                joined[prev_idx].mv.shift_switch_points(0.0, trimmed_len);
+                let before = next.mv.geo.length();
                 trim_start(&mut next.mv.geo, pt, plane, normal_coord)
                     .map_err(|e| gouge(src_line, e))?;
+                let after = next.mv.geo.length();
+                next.mv.shift_switch_points(before - after, after);
             }
             joined.push(next);
         }
@@ -314,6 +327,9 @@ impl ToolRadiusCorrection {
                     aux_start: first.aux_start.clone(),
                     aux_end: first.aux_start.clone(),
                     trc: mode,
+                    accel: first.accel,
+                    decel: first.decel,
+                    switch_points: Vec::new(),
                     src_line: line0,
                     obj_no: first.obj_no,
                 },
@@ -333,6 +349,9 @@ impl ToolRadiusCorrection {
                     aux_start: chain[last_src].aux_end.clone(),
                     aux_end: chain[last_src].aux_end.clone(),
                     trc: mode,
+                    accel: chain[last_src].accel,
+                    decel: chain[last_src].decel,
+                    switch_points: Vec::new(),
                     src_line: chain[last_src].src_line,
                     obj_no: chain[last_src].obj_no,
                 },

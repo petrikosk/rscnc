@@ -116,7 +116,7 @@ fn last(run: &Run) -> &IplOutput {
 
 #[test]
 fn square_endpoint_and_limits() {
-    let run = run_program("G1 F1200 X10\nY10\nX0\nY0\n");
+    let run = run_program("G1 F20 X10\nY10\nX0\nY0\n");
     assert_path_limits(&run, &limits());
     assert_continuity(&run, &limits());
     let end = last(&run);
@@ -140,7 +140,7 @@ fn square_endpoint_and_limits() {
 #[test]
 fn full_circle_stays_on_circle() {
     // Full CCW circle around (10, 0) starting/ending at origin
-    let run = run_program("G3 F1200 X0 Y0 I10 J0\n");
+    let run = run_program("G3 F20 X0 Y0 I10 J0\n");
     assert_path_limits(&run, &limits());
     for (i, out) in run.outputs.iter().enumerate() {
         let dx = out.path_position[0] - 10.0;
@@ -167,7 +167,7 @@ fn full_circle_stays_on_circle() {
 #[test]
 fn tangent_junctions_blend_without_stopping() {
     // line → quarter arc (tangent) → line (tangent): junction velocities > 0
-    let run = run_program("G1 F1200 X10\nG3 X14 Y4 I0 J4\nG1 Y14\n");
+    let run = run_program("G1 F20 X10\nG3 X14 Y4 I0 J4\nG1 Y14\n");
     assert_path_limits(&run, &limits());
     assert_continuity(&run, &limits());
     // At every segment transition (obj_no change) velocity stays well above zero
@@ -188,7 +188,7 @@ fn tangent_junctions_blend_without_stopping() {
 #[test]
 fn sharp_corner_slows_down() {
     // 90° corner must be slower than cruise but the program still finishes exactly
-    let run = run_program("G1 F1200 X20\nY20\n");
+    let run = run_program("G1 F20 X20\nY20\n");
     assert_path_limits(&run, &limits());
     let mut corner_v = None;
     for i in 1..run.outputs.len() {
@@ -208,7 +208,7 @@ fn sharp_corner_slows_down() {
 #[test]
 fn override_pause_resume() {
     let mut paused_seen = false;
-    let run = run_with("G1 F1200 X30\n", |i, cnc| {
+    let run = run_with("G1 F20 X30\n", |i, cnc| {
         match i {
             400 => cnc.interpolator.set_override(0.4),
             800 => cnc.interpolator.set_override(0.0),
@@ -254,7 +254,7 @@ fn override_pause_resume() {
 
 #[test]
 fn events_and_dwell() {
-    let run = run_program("G1 F1200 X5 M8\nG4 P0.25\nX10 M9\nM30\n");
+    let run = run_program("G1 F20 X5 M8\nG4 P0.25\nX10 M9\nM30\n");
     // M8 exactly once, at the end of the first move (s ≈ 5)
     let m8: Vec<_> = run
         .outputs
@@ -293,7 +293,7 @@ fn events_and_dwell() {
 fn single_step_holds_at_boundaries() {
     let mut cnc = controller();
     let mut pipeline = Pipeline::new();
-    cnc.load_program("G1 F1200 X5\nY5\n", DecoderConfig::default(), &mut pipeline)
+    cnc.load_program("G1 F20 X5\nY5\n", DecoderConfig::default(), &mut pipeline)
         .unwrap();
     // Enabling single-step mid-flight retargets the running segment to stop
     // at its end
@@ -342,7 +342,7 @@ fn aux_axis_caps_path_velocity() {
         ..Default::default()
     };
     let mut pipeline = Pipeline::new();
-    cnc.load_program("G1 F1200 X10 A90\n", cfg, &mut pipeline)
+    cnc.load_program("G1 F20 X10 A90\n", cfg, &mut pipeline)
         .unwrap();
     let mut driver = SimDriver::<4>::new();
     let mut v_max_seen = 0.0f64;
@@ -380,7 +380,7 @@ fn planned_facts_are_readable_from_the_interpolator() {
         start_aux: vec![7.0],
         ..Default::default()
     };
-    let queue = Decoder::decode_source(cfg, "G0 X5 A10\nG1 F600 Y12\n").expect("decodes");
+    let queue = Decoder::decode_source(cfg, "G0 X5 A10\nG1 F10 Y12\n").expect("decodes");
     let mut ipl = Interpolator::new(limits(), LookAhead::default(), vec![100.0], DT);
     ipl.load(queue).expect("loads");
 
@@ -426,7 +426,7 @@ fn planned_facts_are_readable_from_the_interpolator() {
 
 #[test]
 fn cycle_into_is_identical_to_cycle() {
-    let src = "G1 F1200 X10 A45 M8\nG4 P0.05\nG3 X14 Y4 I0 J4 A90\nG0 X0 Y0\n";
+    let src = "G1 F20 X10 A45 M8\nG4 P0.05\nG3 X14 Y4 I0 J4 A90\nG0 X0 Y0\n";
     let cfg = || DecoderConfig {
         aux_letters: vec!['A'],
         start_aux: vec![0.0],
@@ -467,7 +467,7 @@ fn cycle_into_is_identical_to_cycle() {
 
 #[test]
 fn preprocessed_rounded_square_is_faster_and_exact() {
-    let src = "G1 F1200 X20\nY20\nX0\nY0\n";
+    let src = "G1 F20 X20\nY20\nX0\nY0\n";
     let sharp = run_program(src);
 
     let mut cnc = controller();
@@ -499,4 +499,60 @@ fn preprocessed_rounded_square_is_faster_and_exact() {
     );
     let end = rounded.outputs.last().unwrap();
     assert!(end.path_position[0].abs() < 1e-8 && end.path_position[1].abs() < 1e-8);
+}
+
+#[test]
+fn switch_points_fire_at_their_position_on_the_path() {
+    // H12 twenty units along a 100 mm line, H-12 ten units before its end.
+    let run = run_program("G1 F20 X100 H12 L20 H-12 L-10\n");
+    let mut fired: Vec<(i32, f64)> = Vec::new();
+    for out in &run.outputs {
+        for sp in &out.switch_points {
+            fired.push((sp.number, out.s_total));
+        }
+    }
+    assert_eq!(fired.len(), 2, "fired {fired:?}");
+    assert_eq!((fired[0].0, fired[1].0), (12, -12));
+    // Reported within one cycle of travel of the programmed position
+    let slack = limits().max_velocity * DT + 1e-9;
+    assert!((fired[0].1 - 20.0).abs() < slack, "on at {}", fired[0].1);
+    assert!((fired[1].1 - 90.0).abs() < slack, "off at {}", fired[1].1);
+    // Every switch point of the program is reported exactly once
+    let total: usize = run.outputs.iter().map(|o| o.switch_points.len()).sum();
+    assert_eq!(total, 2);
+}
+
+#[test]
+fn switch_points_survive_a_pause_across_the_point() {
+    // Pause while approaching the switch point: it must still be reported,
+    // exactly once, when the path finally crosses it.
+    let run = run_with("G1 F20 X100 H3 O0.5\n", |i, cnc| match i {
+        200 => cnc.interpolator.set_override(0.0),
+        1200 => cnc.interpolator.set_override(1.0),
+        _ => {}
+    });
+    let fired: Vec<i32> = run
+        .outputs
+        .iter()
+        .flat_map(|o| o.switch_points.iter().map(|sp| sp.number))
+        .collect();
+    assert_eq!(fired, vec![3]);
+}
+
+#[test]
+fn e_word_limits_the_acceleration_the_profile_uses() {
+    // The machine allows 500 mm/s²; E50 must hold the ramp to 50 mm/s².
+    let run = run_program("G1 F20 E50 E-25 X200\n");
+    let mut peak_accel: f64 = 0.0;
+    let mut peak_decel: f64 = 0.0;
+    for out in &run.outputs {
+        peak_accel = peak_accel.max(out.path_acceleration);
+        peak_decel = peak_decel.max(-out.path_acceleration);
+    }
+    assert!(peak_accel <= 50.0 + 1e-6, "peak accel {peak_accel}");
+    assert!(peak_decel <= 25.0 + 1e-6, "peak decel {peak_decel}");
+    // and the limits are actually used, not just respected by being slow
+    assert!(peak_accel > 45.0, "peak accel {peak_accel}");
+    assert!(peak_decel > 22.0, "peak decel {peak_decel}");
+    assert!(last(&run).path_position[0] - 200.0 < 1e-8);
 }

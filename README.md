@@ -21,9 +21,18 @@ retargets from the current state, which is exactly what Ruckig was built for.
 
 - **DIN 66025 decoder** — `G0 G1 G2 G3` (lines, arcs in all planes, IJK center and R radius
   format, helical arcs), `G4` dwell, `G17/G18/G19` planes, `G40/G41/G42` tool radius
-  correction modes, `G70/G71` (+ `G20/G21`) units, `G90/G91`, `G92` preset, `F S T M H`
+  correction modes, `G70/G71` (+ `G20/G21`) units, `G90/G91`, `G92` preset, `F S T M`
   words, `N` numbers, comments, block delete, `M2/M30` program end. Modal state machine,
   strict semantic errors with source line numbers.
+- **CODESYS-compatible dynamics words** — `F` is the path velocity in units/**second**, `E`
+  the maximum path acceleration (positive) or deceleration (negative), `FF`/`EF` the same
+  pair for `G0` rapids, and `F<axis>`/`E<axis>` the limits of one auxiliary axis. All are
+  modal, and the per-segment values reach both the look-ahead and the jerk-limited profile.
+- **Switch points (`H` functions)** — `H` with `L` (distance from the element's start, or
+  from its end when negative) or `O` (relative position in `[0, 1]`) puts a switch point
+  *inside* a path element; a positive `H` switches its function on, a negative one off.
+  Several fit in one block, they survive tool radius correction and corner rounding, and
+  the interpolator reports each one in the cycle it is crossed.
 - **Generic N-axis** — 2 or 3 geometric path axes plus any number of auxiliary synchronized
   axes (`A B C U V W ...`), which interpolate linearly over the path and cap the path
   velocity so their own limits are never exceeded.
@@ -129,7 +138,8 @@ cargo run --release --bin example_file -- path/to/program.nc
 
 ## Units and conventions
 
-Internally everything is **mm, s** (feeds `F` are programmed in units/min and converted).
+Internally everything is **mm, s**. `F` and `E` are programmed in units per second and per
+second squared, as in CODESYS SoftMotion — *not* the units/min of many CAM dialects.
 Any consistent unit system works — see rsruckig's numerical guidance (state values are
 exact to ~1e-8 in the chosen unit). Auxiliary axis words are not unit-scaled (typically
 rotary degrees). Arcs follow DIN/LinuxCNC conventions: IJK are incremental offsets from

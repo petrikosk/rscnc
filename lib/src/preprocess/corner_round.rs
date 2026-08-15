@@ -4,7 +4,9 @@
 
 use super::Preprocessor;
 use crate::error::PreprocessError;
-use crate::geometry::{dot, norm, sub, ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment};
+use crate::geometry::{
+    dot, min_opt, norm, sub, ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment,
+};
 use crate::queue::GeoQueue;
 use crate::types::WorkPlane;
 
@@ -90,7 +92,7 @@ impl CornerRounding {
         let aux_tp1 = lerp(&a.aux_start, &a.aux_end, ua);
         let aux_tp2 = lerp(&b.aux_start, &b.aux_end, ub);
 
-        let short_a = GeoMove {
+        let mut short_a = GeoMove {
             geo: Geometry::Line(LineSeg::new(la.p0, tp1)),
             aux_end: aux_tp1.clone(),
             ..a.clone()
@@ -102,14 +104,23 @@ impl CornerRounding {
             aux_start: aux_tp1,
             aux_end: aux_tp2.clone(),
             trc: a.trc,
+            // The fillet replaces the corner both segments' dynamics met at.
+            accel: min_opt(a.accel, b.accel),
+            decel: min_opt(a.decel, b.decel),
+            // Switch points stay on the elements they were programmed on.
+            switch_points: Vec::new(),
             src_line: a.src_line,
             obj_no: a.obj_no,
         };
-        let short_b = GeoMove {
+        let mut short_b = GeoMove {
             geo: Geometry::Line(LineSeg::new(tp2, lb.p1)),
             aux_start: aux_tp2,
             ..b.clone()
         };
+        // The corner is cut off the end of a and the start of b: a's switch
+        // points keep their distance to its start, b's move up with its start.
+        short_a.shift_switch_points(0.0, len_a - d);
+        short_b.shift_switch_points(d, len_b - d);
         Some((short_a, arc_move, short_b))
     }
 }

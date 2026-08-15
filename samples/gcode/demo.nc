@@ -1,11 +1,12 @@
-% demo part: contour with arcs, tool radius correction, dwell and M functions
+% demo part: contour with arcs, tool radius correction, dwell,
+% M functions, E dynamics and an H switch point
 N10 G21 G90
 N20 M3 S8000
 N30 G0 X-10 Y-10
-N40 G41 G1 F1200 X0 Y0
+N40 G41 G1 F20 E200 E-150 X0 Y0
 N50 X50
 N60 G3 X60 Y10 I0 J10
-N70 G1 Y30
+N70 G1 Y30 H1 O0.5
 N80 G3 X50 Y40 I-10 J0
 N90 G1 X10
 N100 G3 X0 Y30 I0 J-10

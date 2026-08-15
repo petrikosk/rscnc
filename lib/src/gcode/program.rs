@@ -72,8 +72,30 @@ pub struct ModalState {
     pub distance: DistanceMode,
     /// Active unit system (G70/G71).
     pub units: Units,
-    /// Programmed feed, internal units/s (F is units/min in the source).
+    /// Programmed feed, internal units/s (the `F` word, which is units/s).
     pub feed: f64,
+    /// Programmed path acceleration from a positive `E` word, internal
+    /// units/s². `None` leaves the machine limit as the only bound.
+    pub accel: Option<f64>,
+    /// Programmed path deceleration from a negative `E` word, stored as a
+    /// positive magnitude, internal units/s².
+    pub decel: Option<f64>,
+    /// Programmed G0 feed from an `FF` word, internal units/s. `None` uses
+    /// the decoder's configured rapid feed.
+    pub rapid_feed: Option<f64>,
+    /// Programmed G0 acceleration from a positive `EF` word, internal units/s².
+    pub rapid_accel: Option<f64>,
+    /// Programmed G0 deceleration from a negative `EF` word, internal units/s².
+    pub rapid_decel: Option<f64>,
+    /// Per-auxiliary-axis velocity limits from `F<axis>` words, in decoder
+    /// order and in the auxiliary axes' own units/s.
+    pub aux_feed: Vec<Option<f64>>,
+    /// Per-auxiliary-axis acceleration limits from positive `E<axis>` words,
+    /// in decoder order and in the auxiliary axes' own units/s².
+    pub aux_accel: Vec<Option<f64>>,
+    /// Per-auxiliary-axis deceleration limits from negative `E<axis>` words,
+    /// positive magnitudes, in decoder order.
+    pub aux_decel: Vec<Option<f64>>,
     /// Programmed spindle speed from the last S word.
     pub spindle_speed: f64,
     /// Active tool from the last T word.
@@ -100,6 +122,14 @@ impl ModalState {
             distance: DistanceMode::default(),
             units: Units::default(),
             feed: 0.0,
+            accel: None,
+            decel: None,
+            rapid_feed: None,
+            rapid_accel: None,
+            rapid_decel: None,
+            aux_feed: vec![None; aux_axes],
+            aux_accel: vec![None; aux_axes],
+            aux_decel: vec![None; aux_axes],
             spindle_speed: 0.0,
             tool: 0,
             trc: TrcMode::default(),

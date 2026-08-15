@@ -48,6 +48,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out = cnc.cycle(&mut driver)?;
         t.push(*driver.log.time.last().unwrap());
         v_path.push(out.path_velocity);
+        for sp in &out.switch_points {
+            println!(
+                "t = {:7.3} s  line {:3}: switch point {} {}",
+                t.last().unwrap(),
+                sp.src_line,
+                sp.id(),
+                if sp.is_on() { "on" } else { "off" }
+            );
+        }
         for e in &out.events {
             println!(
                 "t = {:7.3} s  line {:3}: M{:?} S{:?} T{:?}",

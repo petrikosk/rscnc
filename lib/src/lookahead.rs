@@ -38,6 +38,12 @@ pub struct PlannedSegment {
     pub v_cap: f64,
     /// Exit (junction) velocity at the end of this segment.
     pub v_exit: f64,
+    /// Acceleration limit on this segment: the machine limit, tightened by a
+    /// programmed positive `E` word.
+    pub accel: f64,
+    /// Deceleration limit on this segment: the machine limit, tightened by a
+    /// programmed negative `E` word.
+    pub decel: f64,
 }
 
 impl LookAhead {
@@ -53,18 +59,22 @@ impl LookAhead {
         let mut segs: Vec<PlannedSegment> = Vec::new();
         for (qi, elem) in queue.iter().enumerate() {
             if let GeoElem::Move(mv) = elem {
+                let cap = |programmed: Option<f64>| {
+                    programmed.map_or(limits.max_acceleration, |a| a.min(limits.max_acceleration))
+                };
                 segs.push(PlannedSegment {
                     queue_index: qi,
                     length: mv.param_length(),
                     v_cap: self.segment_cap(mv, limits, aux_max_velocity),
                     v_exit: 0.0,
+                    accel: cap(mv.accel),
+                    decel: cap(mv.decel),
                 });
             }
         }
 
         // Junction velocity between consecutive moves. Any non-move element
         // in between (dwell, synchronized event) forces an exact stop.
-        let a_eff = limits.max_acceleration * self.accel_margin;
         let n = segs.len();
         for i in 0..n {
             let is_last = i + 1 == n;
@@ -87,19 +97,22 @@ impl LookAhead {
         }
 
         // Backward pass: an exit velocity must be reachable *down* from the
-        // following segments' exits.
+        // following segments' exits — braking over the next segment, so with
+        // that segment's deceleration limit.
         for i in (0..n.saturating_sub(1)).rev() {
             if segs[i + 1].queue_index == segs[i].queue_index + 1 {
+                let d_eff = segs[i + 1].decel * self.accel_margin;
                 let reachable =
-                    (segs[i + 1].v_exit.powi(2) + 2.0 * a_eff * segs[i + 1].length).sqrt();
+                    (segs[i + 1].v_exit.powi(2) + 2.0 * d_eff * segs[i + 1].length).sqrt();
                 segs[i].v_exit = segs[i].v_exit.min(reachable);
             }
         }
 
         // Forward pass: and reachable *up* from the entry velocity
-        // (program starts at rest).
+        // (program starts at rest), with this segment's acceleration limit.
         let mut v_entry = 0.0;
         for seg in segs.iter_mut() {
+            let a_eff = seg.accel * self.accel_margin;
             let reachable = (v_entry * v_entry + 2.0 * a_eff * seg.length).sqrt();
             seg.v_exit = seg.v_exit.min(reachable);
             v_entry = seg.v_exit;
@@ -173,9 +186,9 @@ mod tests {
 
     #[test]
     fn colinear_junction_keeps_feed() {
-        let p = plan("G1 F1200 X10\nX20\nX30\n");
+        let p = plan("G1 F20 X10\nX20\nX30\n");
         assert_eq!(p.len(), 3);
-        // 1200 mm/min = 20 mm/s; colinear junctions blend at full feed
+        // F is units/s; colinear junctions blend at full feed
         assert!((p[0].v_exit - 20.0).abs() < 1e-9, "v_exit {}", p[0].v_exit);
         assert!((p[1].v_exit - 20.0).abs() < 1e-9);
         assert!(p[2].v_exit == 0.0);
@@ -183,7 +196,7 @@ mod tests {
 
     #[test]
     fn right_angle_slows_reversal_stops() {
-        let p = plan("G1 F1200 X10\nY10\nX0\nX10\n");
+        let p = plan("G1 F20 X10\nY10\nX0\nX10\n");
         // 90° corner: finite but > 0
         assert!(p[0].v_exit > 0.0 && p[0].v_exit < 20.0);
         // reversal X0 -> X10 must stop
@@ -204,7 +217,7 @@ mod tests {
         // Radius 2 arc: v ≤ sqrt(500 * 2) ≈ 31.6, but feed 40 mm/s on a line.
         // The junction line→arc is tangent-continuous, so the exit velocity
         // is capped by the arc's curvature cap, not the corner rule.
-        let p = plan("G1 F2400 X10\nG3 X12 Y2 I0 J2\n");
+        let p = plan("G1 F40 X10\nG3 X12 Y2 I0 J2\n");
         let arc_cap = (500.0f64 * 2.0).sqrt();
         assert!(p[0].v_exit <= arc_cap + 1e-9, "v_exit {}", p[0].v_exit);
         assert!(p[1].v_cap <= arc_cap.min(40.0) + 1e-9);
@@ -217,7 +230,7 @@ mod tests {
     #[test]
     fn short_segments_limit_reachability() {
         // 0.1 mm segments at high feed: forward pass must keep exits low
-        let p = plan("G1 F6000 X0.1\nX0.2\nX0.3\n");
+        let p = plan("G1 F100 X0.1\nX0.2\nX0.3\n");
         let a_eff = 500.0 * 0.8;
         let reach1 = (2.0f64 * a_eff * 0.1).sqrt();
         assert!(p[0].v_exit <= reach1 + 1e-9);

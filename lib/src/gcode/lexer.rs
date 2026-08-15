@@ -4,6 +4,10 @@
 //! `;` to end of line are stripped. Words are a letter followed by a signed
 //! decimal number (`G1`, `X-12.5`, `F1500.`). Whitespace between and inside
 //! words is ignored (`G 01` is valid, as legacy paper-tape dialects allow).
+//!
+//! `E` and `F` may carry a qualifying second letter written tight against the
+//! first (`FF`, `EF`, `FA`, `EU`); it is kept in [`Word::suffix`] and the
+//! decoder gives it meaning.
 
 use crate::error::GcodeError;
 
@@ -12,10 +16,28 @@ use crate::error::GcodeError;
 pub struct Word {
     /// Address letter, uppercased (`G`, `X`, `F`, ...).
     pub letter: char,
+    /// Qualifying second letter of the address, uppercased, for the two-letter
+    /// forms `FF`/`EF` (G0 feed and acceleration) and `F<axis>`/`E<axis>`
+    /// (one auxiliary axis' feed and acceleration). `None` for plain words.
+    pub suffix: Option<char>,
     /// Numeric value following the letter.
     pub value: f64,
     /// 1-based source line.
     pub line: usize,
+}
+
+impl Word {
+    /// The word's address as written, e.g. `X`, `FF` or `EA`.
+    pub fn name(&self) -> String {
+        Self::name_of(self.letter, self.suffix)
+    }
+
+    fn name_of(letter: char, suffix: Option<char>) -> String {
+        match suffix {
+            Some(s) => format!("{letter}{s}"),
+            None => letter.to_string(),
+        }
+    }
 }
 
 /// One block (source line) of words. `N` line numbers are split off.
@@ -93,6 +115,18 @@ fn lex_line(line: &str, src_line: usize) -> Result<Vec<Word>, GcodeError> {
             c if c.is_ascii_alphabetic() => {
                 let letter = c.to_ascii_uppercase();
                 chars.next();
+                // A second letter immediately after E or F qualifies the word
+                // (`FF`/`EF` for G0, `F<axis>`/`E<axis>` for one auxiliary
+                // axis). No whitespace is allowed between the two letters, so
+                // an ordinary word is never mistaken for a qualified one.
+                let suffix = match (letter, chars.peek()) {
+                    ('E' | 'F', Some(c)) if c.is_ascii_alphabetic() => {
+                        let s = c.to_ascii_uppercase();
+                        chars.next();
+                        Some(s)
+                    }
+                    _ => None,
+                };
                 // skip whitespace between letter and number
                 while chars.peek().is_some_and(|c| c.is_whitespace()) {
                     chars.next();
@@ -111,13 +145,15 @@ fn lex_line(line: &str, src_line: usize) -> Result<Vec<Word>, GcodeError> {
                     }
                 }
                 let value: f64 = num.parse().map_err(|_| {
+                    let name = Word::name_of(letter, suffix);
                     GcodeError::new(
                         src_line,
-                        format!("word '{letter}' is missing a valid number (got '{num}')"),
+                        format!("word '{name}' is missing a valid number (got '{num}')"),
                     )
                 })?;
                 words.push(Word {
                     letter,
+                    suffix,
                     value,
                     line: src_line,
                 });
@@ -165,6 +201,36 @@ mod tests {
             ('G', 1.0)
         );
         assert_eq!(blocks[0].words[1].value, 12.5);
+    }
+
+    #[test]
+    fn two_letter_words() {
+        let blocks = lex("G0 FF200 EF1000 X10 FA30\n").unwrap();
+        let w = &blocks[0].words;
+        assert_eq!(
+            (w[1].letter, w[1].suffix, w[1].value),
+            ('F', Some('F'), 200.0)
+        );
+        assert_eq!(
+            (w[2].letter, w[2].suffix, w[2].value),
+            ('E', Some('F'), 1000.0)
+        );
+        assert_eq!((w[3].letter, w[3].suffix), ('X', None));
+        assert_eq!(
+            (w[4].letter, w[4].suffix, w[4].value),
+            ('F', Some('A'), 30.0)
+        );
+        assert_eq!(w[4].name(), "FA");
+        // A gap between the letters is not a qualified word: `F 50` is F50.
+        let blocks = lex("G1 F 50 X1\n").unwrap();
+        assert_eq!(
+            (
+                blocks[0].words[1].letter,
+                blocks[0].words[1].suffix,
+                blocks[0].words[1].value
+            ),
+            ('F', None, 50.0)
+        );
     }
 
     #[test]

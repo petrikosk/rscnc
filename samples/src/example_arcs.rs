@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 40×20 rectangle with r=5 corners, CW contour (G2 arcs)
     let program = "\
 N10 G21 G90
-N20 G1 F3000 X35
+N20 G1 F50 X35
 N30 G2 X40 Y5 I0 J5
 N40 G1 Y15
 N50 G2 X35 Y20 I-5 J0

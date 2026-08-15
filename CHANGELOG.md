@@ -5,7 +5,55 @@ All notable changes to this project are documented here. The format follows
 [semantic versioning](https://semver.org/) (pre-1.0: `0.1.x` stays
 API-compatible).
 
-## [0.1.1] — unreleased
+## [0.2.0] — unreleased
+
+The DIN 66025 dialect grows the CODESYS SoftMotion words a real program uses
+for dynamics and switching — and corrects the meaning of `F`. A program that
+runs under `SMC_NCDecoder` now decodes here, at the same speed.
+
+### Changed — breaking
+
+- **`F` is units per second, not units per minute.** CODESYS SoftMotion
+  documents the DIN 66025 `F` word as "Velocity (in [u/sec])", and rscnc
+  divided it by 60. Every program written for a SoftMotion control therefore
+  ran 60× too slow, silently. `F` (and the new `E`) are now taken as
+  units/second and units/second², scaled only by the active `G70`/`G71` unit
+  mode. **Programs written against 0.1.x must divide their `F` values by 60.**
+- **`SyncEvent::h` is gone.** `H` is not an M-function parameter but a switch
+  point on the path element, and is reported as such (see below).
+- **`Word` carries a `suffix`.** `E`/`F` may take a qualifying second letter
+  (`FF`, `EF`, `FA`), so the lexer's `Word` gained a field; `Word` literals
+  need `suffix: None`.
+- **`GeoMove` carries `accel`, `decel` and `switch_points`**, and
+  `PlannedSegment` carries `accel` and `decel`; literals of either need them.
+
+### Added
+
+- **`E` — path acceleration and deceleration.** Positive sets the maximum path
+  acceleration, negative the maximum deceleration, both in units/s² and both
+  modal, exactly as CODESYS reads them (`F100 E100 E-200`). The values reach
+  the look-ahead's reachability passes *and* the jerk-limited profile, where an
+  asymmetric pair becomes rsruckig's `min_acceleration`.
+- **`FF` / `EF` — the same two for `G0` rapids**, overriding
+  `DecoderConfig::rapid_feed` when programmed.
+- **`F<axis>` / `E<axis>` — one auxiliary axis' own velocity and acceleration
+  limits.** An auxiliary axis moving Δ over an element of length L runs at
+  `v·Δ/L`, so a programmed axis limit folds into that element's path limits at
+  decode time.
+- **`H` / `L` / `O` — switch points inside a path element.** `H<n>` names the
+  switch function (positive on, negative off) and `L`/`O` place it: `L` is the
+  distance from the element's start, or from its end when negative; `O` is the
+  relative position in `[0, 1]`. Several fit in one block
+  (`N100 G1 X100 H2 L20 H-2 L-10`), an `H` in a block without geometry rides on
+  the next element, and one that resolves outside its element is refused with
+  its source line. `GeoMove::switch_points` survives tool radius correction
+  (rescaled) and corner rounding (shifted with the trim), and
+  `IplOutput::switch_points` reports each one in the cycle the interpolator
+  crosses it — including across a pause that stops short of the point. Steady
+  state stays allocation-free: `lib/tests/allocation.rs` now runs two switch
+  points per element inside the measured window.
+
+## [0.1.1]
 
 Four fixes found while building a real-time consumer (and a wasm bridge) on
 0.1.0. All changes are additive: no existing signature, type or variant

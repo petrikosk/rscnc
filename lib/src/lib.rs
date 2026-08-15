@@ -38,7 +38,9 @@ pub mod prelude {
     pub use crate::driver::{AxisDriver, SimDriver, TrajectoryLog};
     pub use crate::error::{CncError, DecodeError, GcodeError};
     pub use crate::gcode::lexer::lex;
-    pub use crate::geometry::{ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment, SyncEvent};
+    pub use crate::geometry::{
+        ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment, SwitchPoint, SyncEvent,
+    };
     pub use crate::interpolator::{Interpolator, IplOutput, IplState};
     pub use crate::kinematics::{CartesianKinematics, Kinematics};
     pub use crate::lookahead::{LookAhead, PlannedSegment};

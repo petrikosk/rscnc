@@ -10,11 +10,8 @@ use rscnc::prelude::*;
 const DT: f64 = 0.001;
 
 fn program() -> GeoQueue {
-    Decoder::decode_source(
-        DecoderConfig::default(),
-        "G1 F600 X10\nY10\nG2 X20 Y0 R10\n",
-    )
-    .expect("program decodes")
+    Decoder::decode_source(DecoderConfig::default(), "G1 F10 X10\nY10\nG2 X20 Y0 R10\n")
+        .expect("program decodes")
 }
 
 fn interpolator(limits: PathLimits, cycle_time: f64) -> Interpolator {

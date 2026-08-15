@@ -13,7 +13,7 @@ use rscnc::prelude::*;
 const DT: f64 = 0.001;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let program = "G21 G90\nG1 F1500 X100\nM30\n";
+    let program = "G21 G90\nG1 F25 X100\nM30\n";
 
     let axis_config =
         AxisConfig::<3>::cartesian(["X", "Y", "Z"], [80.0; 3], [500.0; 3], [8000.0; 3]);

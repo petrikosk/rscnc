@@ -15,7 +15,7 @@ const DT: f64 = 0.001;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let program = "\
 N10 G21 G90
-N20 G1 F1500 X20
+N20 G1 F25 X20
 N30 Y20
 N40 X0
 N50 Y0
