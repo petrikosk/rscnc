@@ -200,8 +200,8 @@ fn run_case(case: u64) {
             }
             l
         };
-        for k in 0..2 {
-            axis_limits.path[k] = limit(&mut rng, f64::INFINITY);
+        for p in axis_limits.path.iter_mut().take(2) {
+            *p = limit(&mut rng, f64::INFINITY);
         }
         for a in &mut axis_limits.aux {
             *a = limit(&mut rng, AUX_LIMIT);

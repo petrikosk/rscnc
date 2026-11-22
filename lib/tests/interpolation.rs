@@ -121,12 +121,8 @@ fn square_endpoint_and_limits() {
     assert_continuity(&run, &limits());
     let end = last(&run);
     assert!(end.path_velocity.abs() < 1e-9);
-    for i in 0..3 {
-        assert!(
-            end.path_position[i].abs() < 1e-8,
-            "endpoint axis {i}: {}",
-            end.path_position[i]
-        );
+    for (i, p) in end.path_position.iter().enumerate() {
+        assert!(p.abs() < 1e-8, "endpoint axis {i}: {p}");
     }
     // s_total equals the programmed path length (perimeter 40)
     assert!((end.s_total - 40.0).abs() < 1e-8, "s_total {}", end.s_total);

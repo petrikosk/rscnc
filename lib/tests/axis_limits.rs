@@ -141,9 +141,10 @@ fn the_velocity_jump_limit_slows_a_corner() {
     let outputs = run_queue(queue(), lookahead, path_limits(jump, jump));
     let mut worst = 0.0f64;
     for w in outputs.windows(2) {
-        for k in 0..2 {
-            let v0 = w[0].path_velocity * w[0].path_tangent[k];
-            let v1 = w[1].path_velocity * w[1].path_tangent[k];
+        let tangents = w[0].path_tangent.iter().zip(&w[1].path_tangent);
+        for (t0, t1) in tangents.take(2) {
+            let v0 = w[0].path_velocity * t0;
+            let v1 = w[1].path_velocity * t1;
             // within a cycle the axis may also accelerate at its limit
             worst = worst.max((v1 - v0).abs() - 500.0 * DT);
         }
