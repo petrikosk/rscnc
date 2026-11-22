@@ -1,6 +1,7 @@
 //! DIN 66025 G-code front end: lexer and modal program state.
 
 pub mod lexer;
+pub(crate) mod macros;
 pub mod program;
 
 pub use lexer::{lex, ParsedBlock, Word};

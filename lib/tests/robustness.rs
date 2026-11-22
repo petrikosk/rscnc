@@ -118,6 +118,7 @@ fn degenerate_lookahead_is_refused() {
         LookAhead {
             junction_deviation: f64::NAN,
             accel_margin: 0.8,
+            ..LookAhead::default()
         },
         vec![],
         DT,
@@ -132,6 +133,7 @@ fn degenerate_lookahead_is_refused() {
         LookAhead {
             junction_deviation: 0.05,
             accel_margin: 0.0,
+            ..LookAhead::default()
         },
         vec![],
         DT,

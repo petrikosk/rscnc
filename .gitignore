@@ -1,3 +1,9 @@
 /target
 *.svg
 !doc/*.svg
+
+# cargo-fuzz: build output, corpus and crash artifacts
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

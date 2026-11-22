@@ -12,9 +12,12 @@
 
 use crate::error::CncError;
 use crate::geometry::{GeoElem, GeoMove, Segment, SwitchPoint, SyncEvent};
-use crate::lookahead::{ramp_distance, LookAhead, PlannedSegment, PLAN_SLACK};
+use crate::lookahead::{
+    bang, ramp_distance, settle_distance, LookAhead, PlanContext, PlannedSegment, CARRY_MARGIN,
+    PLAN_SLACK,
+};
 use crate::queue::GeoQueue;
-use crate::types::{PathLimits, PathPoint};
+use crate::types::{AxisLimits, PathLimits, PathPoint};
 use rsruckig::prelude::*;
 
 /// Standstill threshold for the path velocity.
@@ -35,6 +38,15 @@ const EXIT_SLACK: f64 = 0.5 * PLAN_SLACK;
 struct SegInfo {
     /// Machine velocity ceiling of the move (independent of the feed).
     v_limit: f64,
+    /// Junction velocity limit at the end of the move as the corner rules
+    /// give it (0 where the path stops).
+    junction: f64,
+    /// The carried state at the end of the move is one the carried plan has
+    /// to be followed from.
+    committed: bool,
+    /// Highest velocity at which the span this move ends may be left with
+    /// zero acceleration (the planned exit velocity can be lower).
+    v_safe: f64,
     /// Geometric length of the move (0 for pure auxiliary moves).
     geo_len: f64,
     /// Plan index of the last segment of the span this segment belongs to
@@ -42,6 +54,48 @@ struct SegInfo {
     span_end: usize,
     /// Path length from this segment's end to the end of its span.
     span_rest: f64,
+    /// The path stands still at the end of this move: a dwell, an event
+    /// that is not a fly-by event, or the end of the program follows.
+    stop_after: bool,
+}
+
+/// A plan for the queue including appended elements, waiting to be taken
+/// into use (see [`Interpolator::append`]). After that the vectors hold the
+/// replaced plan, to be dropped outside the control cycle.
+#[derive(Default)]
+struct PendingPlan {
+    active: bool,
+    plan: Vec<PlannedSegment>,
+    seg_info: Vec<SegInfo>,
+    /// Number of queue elements this plan covers.
+    queue_len: usize,
+    total_length: f64,
+}
+
+/// The forward program while the path is traversed backward (see
+/// [`Interpolator::set_reverse`]): everything the reverse track replaced.
+struct Forward {
+    queue: Vec<GeoElem>,
+    plan: Vec<PlannedSegment>,
+    seg_info: Vec<SegInfo>,
+    adopted_len: usize,
+    cursor: usize,
+    plan_pos: usize,
+    s_local: f64,
+    s_done: f64,
+    state: IplState,
+    dwell_remaining: f64,
+    switch_pos: usize,
+    last_src_line: usize,
+    last_obj_no: u32,
+    /// Forward plan index of the move the reverse track begins with.
+    first: usize,
+    /// Forward path length at the end of that move.
+    first_end: f64,
+    /// Forward path length where the direction was changed, and the
+    /// position in the reverse track's first move that corresponds to it.
+    s_total: f64,
+    s_start: f64,
 }
 
 /// Non-panicking rsruckig error handler.
@@ -89,7 +143,12 @@ pub enum IplState {
 /// [`Interpolator::output_buffer`] and fill it with
 /// [`Interpolator::cycle_into`], which reuses the buffer's existing capacity
 /// and performs no heap allocation in steady state.
+///
+/// The struct is `#[non_exhaustive]`: obtain one from
+/// [`Interpolator::output_buffer`], [`IplOutput::with_capacity`] or
+/// `IplOutput::default()`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct IplOutput {
     /// Interpolator state after this cycle.
     pub state: IplState,
@@ -118,6 +177,10 @@ pub struct IplOutput {
     pub s_total: f64,
     /// Fraction of the total program path length completed (0..1).
     pub progress: f64,
+    /// The path is being traversed backward (see
+    /// [`Interpolator::set_reverse`]); `s_total` and `progress` then
+    /// decrease.
+    pub reverse: bool,
 }
 
 impl IplOutput {
@@ -150,7 +213,7 @@ impl IplOutput {
 pub struct Interpolator {
     limits: PathLimits,
     lookahead: LookAhead,
-    aux_max_velocity: Vec<f64>,
+    axis_limits: AxisLimits,
     cycle_time: f64,
 
     queue: Vec<GeoElem>,
@@ -159,6 +222,28 @@ pub struct Interpolator {
     cursor: usize,
     plan_pos: usize,
     total_length: f64,
+    /// Number of elements of `queue` the plan covers; what lies beyond was
+    /// appended and waits in `pending`.
+    adopted_len: usize,
+    pending: PendingPlan,
+    /// Queue indices where an appended piece begins.
+    seams: Vec<usize>,
+    /// Velocity and junction limit the first move of `queue` is entered
+    /// with (non-zero once history has been discarded).
+    entry_velocity: f64,
+    entry_junction: f64,
+    /// The same on the carried plan: state and whether the plan has to be
+    /// followed from it.
+    entry_carry: (f64, f64),
+    entry_committed: bool,
+    /// Backward traversal: what was asked for, and the forward program
+    /// while it is in effect.
+    reverse_request: bool,
+    forward: Option<Box<Forward>>,
+    /// How far the program has got before the path was first run backward
+    /// (queue index, switch points reported of that move): events, dwells
+    /// and switch points before it are not repeated on the way forward.
+    high_water: (usize, usize),
 
     otg: Ruckig<1, ReturnErrorHandler>,
     input: InputParameter<1>,
@@ -172,12 +257,21 @@ pub struct Interpolator {
     traj_single_step: bool,
     /// Effective exit velocity the current trajectory was planned for.
     planned_v_exit: f64,
+    /// Path acceleration the running profile ends with (non-zero on the
+    /// carried plan only).
+    planned_a_exit: f64,
+    /// Fault injection: the generator finds no profile from a state with
+    /// deceleration to a carried state.
+    #[cfg(test)]
+    carried_fault: bool,
     /// Plan index of the segment the current trajectory ends in.
     traj_end: usize,
     /// The current trajectory is a velocity-controlled brake down to the
     /// cruise cap, to be followed by a regular profile.
-    /// Deceleration limit the running stop profile was planned with.
+    /// Deceleration and jerk limits the running stop profile was planned
+    /// with.
     stop_decel: f64,
+    stop_jerk: f64,
     slowing: bool,
     /// The trajectory runs in the coordinates of the segment it was planned
     /// in; this is the length of the segments it has crossed since.
@@ -214,17 +308,35 @@ pub struct Interpolator {
 impl Interpolator {
     /// New idle interpolator. `aux_max_velocity` holds the velocity limits
     /// of the auxiliary axes in decoder order; `cycle_time` is the control
-    /// period in seconds.
+    /// period in seconds. See [`with_axis_limits`](Self::with_axis_limits)
+    /// for per-axis acceleration, jerk and velocity-jump limits.
     pub fn new(
         limits: PathLimits,
         lookahead: LookAhead,
         aux_max_velocity: Vec<f64>,
         cycle_time: f64,
     ) -> Self {
+        Self::with_axis_limits(
+            limits,
+            lookahead,
+            AxisLimits::from_aux_velocity(&aux_max_velocity),
+            cycle_time,
+        )
+    }
+
+    /// New idle interpolator with per-axis limits on top of the path
+    /// limits (see [`AxisLimits`]); `cycle_time` is the control period in
+    /// seconds.
+    pub fn with_axis_limits(
+        limits: PathLimits,
+        lookahead: LookAhead,
+        axis_limits: AxisLimits,
+        cycle_time: f64,
+    ) -> Self {
         Self {
             limits,
             lookahead,
-            aux_max_velocity,
+            axis_limits,
             cycle_time,
             queue: Vec::new(),
             plan: Vec::new(),
@@ -232,6 +344,16 @@ impl Interpolator {
             cursor: 0,
             plan_pos: 0,
             total_length: 0.0,
+            adopted_len: 0,
+            pending: PendingPlan::default(),
+            seams: Vec::new(),
+            entry_velocity: 0.0,
+            entry_junction: 0.0,
+            entry_carry: (0.0, 0.0),
+            entry_committed: false,
+            reverse_request: false,
+            forward: None,
+            high_water: (0, 0),
             otg: Ruckig::new(None, cycle_time),
             input: InputParameter::new(None),
             traj: Trajectory::new(None),
@@ -240,8 +362,12 @@ impl Interpolator {
             traj_override: 1.0,
             traj_single_step: false,
             planned_v_exit: 0.0,
+            planned_a_exit: 0.0,
+            #[cfg(test)]
+            carried_fault: false,
             traj_end: 0,
             stop_decel: 0.0,
+            stop_jerk: 0.0,
             slowing: false,
             traj_s_offset: 0.0,
             state: IplState::Idle,
@@ -287,47 +413,19 @@ impl Interpolator {
     /// steady-state [`cycle_into`](Self::cycle_into) allocates nothing.
     pub fn load(&mut self, queue: GeoQueue) -> Result<(), CncError> {
         self.check_config()?;
-        let detailed = self
-            .lookahead
-            .plan_detailed(&queue, &self.limits, &self.aux_max_velocity);
-        let plan = detailed.segs;
-        let mut seg_info = Vec::with_capacity(plan.len());
-        for (i, seg) in plan.iter().enumerate() {
-            let Some(GeoElem::Move(mv)) = queue.get(seg.queue_index) else {
-                unreachable!("planned indices always point at moves");
-            };
-            let v_limit = detailed.v_limit[i];
-            let geo_len = mv.geo.length();
-            // (NaN is not positive either)
-            let positive = |x: f64| x > 0.0;
-            if !seg.length.is_finite()
-                || !geo_len.is_finite()
-                || !positive(seg.v_cap)
-                || !positive(v_limit)
-                || !positive(seg.accel)
-                || !positive(seg.decel)
-            {
-                return Err(CncError::Interpolator(format!(
-                    "source line {}: move cannot be interpolated (length {}, velocity cap {})",
-                    mv.src_line, seg.length, seg.v_cap
-                )));
-            }
-            seg_info.push(SegInfo {
-                v_limit,
-                geo_len,
-                span_end: i,
-                span_rest: 0.0,
-            });
-        }
-        for i in (0..plan.len().saturating_sub(1)).rev() {
-            if detailed.blend[i] {
-                seg_info[i].span_end = seg_info[i + 1].span_end;
-                seg_info[i].span_rest = seg_info[i + 1].span_rest + plan[i + 1].length;
-            }
-        }
+        let queue: Vec<GeoElem> = queue.into_iter().collect();
+        let (plan, seg_info) = self.build_plan(&queue, &PlanContext::default())?;
         self.plan = plan;
         self.seg_info = seg_info;
-        self.queue = queue.into_iter().collect();
+        self.queue = queue;
+        self.adopted_len = self.queue.len();
+        self.pending = PendingPlan::default();
+        self.seams.clear();
+        (self.entry_velocity, self.entry_junction) = (0.0, 0.0);
+        (self.entry_carry, self.entry_committed) = ((0.0, 0.0), false);
+        self.reverse_request = false;
+        self.forward = None;
+        self.high_water = (0, 0);
         self.total_length = self.plan.iter().map(|p| p.length).sum();
         self.cursor = 0;
         self.plan_pos = 0;
@@ -340,19 +438,13 @@ impl Interpolator {
         self.pending_events.clear();
         self.pending_switches.clear();
         self.switch_pos = 0;
-        self.switch_capacity = self.max_switches_per_cycle().max(EVENT_CAPACITY);
+        self.switch_capacity =
+            max_switches_per_cycle(&self.queue, &self.plan, &self.seg_info, self.cycle_time)
+                .max(EVENT_CAPACITY);
         self.pending_switches.reserve(self.switch_capacity);
         // Worst-case aux width of the program: the per-cycle buffers are
         // reserved for it once, here, and never grow again.
-        self.aux_capacity = self
-            .queue
-            .iter()
-            .filter_map(|e| match e {
-                GeoElem::Move(m) => Some(m.aux_start.len().max(m.aux_end.len())),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
+        self.aux_capacity = aux_width(&self.queue);
         let mut aux = core::mem::take(&mut self.aux_now);
         let mut aux_vel = core::mem::take(&mut self.aux_vel_now);
         aux.clear();
@@ -376,41 +468,320 @@ impl Interpolator {
         Ok(())
     }
 
-    /// Upper bound of the switch points one cycle can cross: those of the
-    /// move the path is in plus those of every following move the cycle can
-    /// reach. A cycle covers at most the highest velocity ceiling times the
-    /// cycle time, and has to traverse the moves in between completely.
-    fn max_switches_per_cycle(&self) -> usize {
-        let count = |i: usize| match self.queue.get(self.plan[i].queue_index) {
-            Some(GeoElem::Move(m)) => m.switch_points.len(),
-            _ => 0,
+    /// Run the look-ahead over `queue` and derive the per-segment facts the
+    /// cycle needs; refuses a path that cannot be interpolated.
+    fn build_plan(
+        &self,
+        queue: &[GeoElem],
+        ctx: &PlanContext,
+    ) -> Result<(Vec<PlannedSegment>, Vec<SegInfo>), CncError> {
+        let detailed = self
+            .lookahead
+            .plan_detailed(queue, &self.limits, &self.axis_limits, ctx);
+        let plan = detailed.segs;
+        let mut seg_info = Vec::with_capacity(plan.len());
+        for (i, seg) in plan.iter().enumerate() {
+            let Some(GeoElem::Move(mv)) = queue.get(seg.queue_index) else {
+                unreachable!("planned indices always point at moves");
+            };
+            let v_limit = detailed.v_limit[i];
+            let geo_len = mv.geo.length();
+            // (NaN is not positive either)
+            let positive = |x: f64| x > 0.0;
+            if !seg.length.is_finite()
+                || !geo_len.is_finite()
+                || !positive(seg.v_cap)
+                || !positive(v_limit)
+                || !positive(seg.accel)
+                || !positive(seg.decel)
+                || !positive(seg.jerk)
+            {
+                return Err(CncError::Interpolator(format!(
+                    "source line {}: move cannot be interpolated (length {}, velocity cap {})",
+                    mv.src_line, seg.length, seg.v_cap
+                )));
+            }
+            seg_info.push(SegInfo {
+                v_limit,
+                junction: detailed.v_junction[i],
+                committed: detailed.committed[i],
+                v_safe: detailed.v_safe[i],
+                geo_len,
+                span_end: i,
+                span_rest: 0.0,
+                stop_after: {
+                    let next = plan.get(i + 1).map_or(queue.len(), |p| p.queue_index);
+                    i + 1 == plan.len()
+                        || (seg.queue_index + 1..next)
+                            .any(|q| queue.get(q).is_some_and(GeoElem::is_stop))
+                },
+            });
+        }
+        for i in (0..plan.len().saturating_sub(1)).rev() {
+            if detailed.blend[i] {
+                seg_info[i].span_end = seg_info[i + 1].span_end;
+                seg_info[i].span_rest = seg_info[i + 1].span_rest + plan[i + 1].length;
+            }
+        }
+        Ok((plan, seg_info))
+    }
+
+    /// Append more path to the loaded program while it runs (streaming, MDI):
+    /// the look-ahead is extended over the new elements, so the path does
+    /// not stop where the previously loaded part ended — unless it had got
+    /// there already.
+    ///
+    /// The path so far must end where the appended piece begins (path point
+    /// and auxiliary axes); anything else is refused, as is a piece that
+    /// cannot be interpolated (see [`load`](Self::load)). A refused piece
+    /// leaves everything as it was. On an interpolator without a program
+    /// this is [`load`](Self::load).
+    ///
+    /// What to expect at the seam between two pieces:
+    ///
+    /// * The junction is planned like any other (corner rule, velocity-jump
+    ///   limits, reachability), but the velocity profile is not planned
+    ///   *through* it: the profile of the part before the seam ends there,
+    ///   so a ramp that crosses a seam does so in two S-curves.
+    /// * The new plan is taken into use at once when the path stands still,
+    ///   and otherwise in the first cycle in which the running profile can
+    ///   be led over to it. Until then the previous plan stays in force —
+    ///   it ends in a stop, so it is always safe. A piece appended only when
+    ///   the path is already braking for the end of the program can
+    ///   therefore still come to a stop there.
+    /// * [`IplOutput::progress`] steps back when the total length grows.
+    ///
+    /// This call plans (and allocates); it is not meant for the control
+    /// cycle itself. The cycle in which the plan is taken into use does not
+    /// allocate. An output buffer obtained before the call may be too small
+    /// for the appended part (more auxiliary axes, denser switch points) and
+    /// then grows once; take a new [`output_buffer`](Self::output_buffer) to
+    /// avoid that.
+    ///
+    /// Not available while the path runs backward
+    /// ([`set_reverse`](Self::set_reverse)).
+    pub fn append(&mut self, queue: GeoQueue) -> Result<(), CncError> {
+        if self.state == IplState::Idle {
+            return self.load(queue);
+        }
+        if self.reverse_request || self.forward.is_some() {
+            return Err(CncError::Interpolator(
+                "cannot append to the program while it runs backward".into(),
+            ));
+        }
+        if queue.is_empty() {
+            return Ok(());
+        }
+        fn as_move(e: &GeoElem) -> Option<&GeoMove> {
+            match e {
+                GeoElem::Move(m) => Some(m),
+                _ => None,
+            }
+        }
+        let last = self.queue.iter().rev().find_map(as_move);
+        if let (Some(a), Some(b)) = (last, queue.iter().find_map(as_move)) {
+            let (end, start) = (a.geo.end(), b.geo.start());
+            let tol = |x: f64| 1e-6 * (1.0 + x.abs());
+            let apart = (0..3).any(|k| (end[k] - start[k]).abs() > tol(end[k]))
+                || a.aux_end
+                    .iter()
+                    .zip(b.aux_start.iter())
+                    .any(|(x, y)| (x - y).abs() > tol(*x));
+            if apart {
+                return Err(CncError::Interpolator(format!(
+                    "source line {}: the appended path does not begin where the path so far ends",
+                    b.src_line
+                )));
+            }
+        }
+        let old_len = self.queue.len();
+        self.seams.push(old_len);
+        self.queue.extend(queue);
+        let ctx = PlanContext {
+            seams: &self.seams,
+            entry_velocity: self.entry_velocity,
+            entry_junction: self.entry_junction,
+            entry_carry: self.entry_carry,
+            entry_committed: self.entry_committed,
         };
-        let n = self.plan.len();
-        if (0..n).all(|i| count(i) == 0) {
+        let (plan, seg_info) = match self.build_plan(&self.queue, &ctx) {
+            Ok(built) => built,
+            Err(e) => {
+                self.queue.truncate(old_len);
+                self.seams.pop();
+                return Err(e);
+            }
+        };
+        // Room for what the new part can need per cycle.
+        self.aux_capacity = self.aux_capacity.max(aux_width(&self.queue[old_len..]));
+        self.switch_capacity = self.switch_capacity.max(max_switches_per_cycle(
+            &self.queue,
+            &plan,
+            &seg_info,
+            self.cycle_time,
+        ));
+        for (buf, cap) in [
+            (&mut self.aux_now, self.aux_capacity),
+            (&mut self.aux_vel_now, self.aux_capacity),
+        ] {
+            buf.reserve(cap.saturating_sub(buf.len()));
+        }
+        let room = self
+            .switch_capacity
+            .saturating_sub(self.pending_switches.len());
+        self.pending_switches.reserve(room);
+        let added: f64 = plan
+            .iter()
+            .filter(|p| p.queue_index >= self.adopted_len)
+            .map(|p| p.length)
+            .sum();
+        self.pending = PendingPlan {
+            active: true,
+            plan,
+            seg_info,
+            queue_len: self.queue.len(),
+            total_length: self.total_length + added,
+        };
+        self.try_adopt(self.effective_override())
+    }
+
+    /// Whether an [appended](Self::append) piece is still waiting to be
+    /// taken into the plan.
+    pub fn append_pending(&self) -> bool {
+        self.pending.active
+    }
+
+    /// Path length that is planned but not yet traversed: how much the
+    /// interpolator has left to run on. A streaming caller appends more
+    /// when this gets short.
+    pub fn remaining_length(&self) -> f64 {
+        let total = if self.pending.active {
+            self.pending.total_length
+        } else {
+            self.total_length
+        };
+        (total - self.forward_s_total()).max(0.0)
+    }
+
+    /// Forget the part of the program that lies more than `keep` path
+    /// length behind the current position, so a program fed in pieces does
+    /// not grow without bound. Returns the number of path elements dropped.
+    ///
+    /// The cut is made where a velocity profile begins (never inside a run
+    /// of moves traversed in one profile), so somewhat more than `keep` can
+    /// remain. What is kept is how far the path can later be run backward
+    /// ([`set_reverse`](Self::set_reverse)). Path lengths
+    /// ([`IplOutput::s_total`], [`total_length`](Self::total_length)) keep
+    /// counting from the original start;
+    /// [`planned_segments`](Self::planned_segments),
+    /// [`start_position`](Self::start_position) and
+    /// [`start_aux`](Self::start_aux) refer to what is left.
+    ///
+    /// Nothing is dropped while the path runs backward or while an appended
+    /// piece is still waiting to be taken into the plan
+    /// ([`append_pending`](Self::append_pending)). Not meant for the control
+    /// cycle itself (it moves memory around).
+    pub fn discard_history(&mut self, keep: f64) -> usize {
+        if self.reverse_request
+            || self.forward.is_some()
+            || self.pending.active
+            || self.plan.is_empty()
+        {
             return 0;
         }
-        let reach = self.seg_info.iter().map(|i| i.v_limit).fold(0.0, f64::max) * self.cycle_time;
-        // Window first..=last: the moves reachable from `first`; `inner` is
-        // the length of the moves after `first` in it.
-        let (mut worst, mut in_window, mut inner, mut last) = (0, 0, 0.0, 0);
-        for first in 0..n {
-            if first == 0 || last < first {
-                last = first;
-                in_window = count(first);
-                inner = 0.0;
-            }
-            while last + 1 < n && inner < reach {
-                last += 1;
-                inner += self.plan[last].length;
-                in_window += count(last);
-            }
-            worst = worst.max(in_window);
-            in_window -= count(first);
-            if last > first {
-                inner -= self.plan[first + 1].length;
+        let span_start = |i: usize| i == 0 || self.seg_info[i - 1].span_end == i - 1;
+        // Back to the start of the span the path is in ...
+        let mut p0 = self.plan_pos.min(self.plan.len() - 1);
+        let mut behind = match self.position_in_plan() {
+            Some((k, s)) if k == p0 => s,
+            _ => 0.0,
+        };
+        while !span_start(p0) {
+            p0 -= 1;
+            behind += self.plan[p0].length;
+        }
+        // ... and further, span by span, until enough is kept.
+        while p0 > 0 && (behind < keep || keep.is_nan()) {
+            p0 -= 1;
+            behind += self.plan[p0].length;
+            while !span_start(p0) {
+                p0 -= 1;
+                behind += self.plan[p0].length;
             }
         }
-        worst
+        if p0 == 0 {
+            return 0;
+        }
+        let q0 = self.plan[p0].queue_index;
+        self.entry_velocity = self.plan[p0 - 1].v_exit;
+        self.entry_junction = self.seg_info[p0 - 1].junction;
+        self.entry_carry = (self.plan[p0 - 1].v_carry, self.plan[p0 - 1].a_carry);
+        self.entry_committed = self.seg_info[p0 - 1].committed;
+        self.queue.drain(..q0);
+        self.plan.drain(..p0);
+        self.seg_info.drain(..p0);
+        for seg in &mut self.plan {
+            seg.queue_index -= q0;
+        }
+        for info in &mut self.seg_info {
+            info.span_end -= p0;
+        }
+        self.cursor -= q0;
+        self.plan_pos -= p0;
+        self.traj_end = self.traj_end.saturating_sub(p0);
+        self.adopted_len -= q0;
+        self.seams.retain(|s| *s > q0);
+        for seam in &mut self.seams {
+            *seam -= q0;
+        }
+        self.high_water = if self.high_water.0 >= q0 {
+            (self.high_water.0 - q0, self.high_water.1)
+        } else {
+            (0, 0)
+        };
+        q0
+    }
+
+    /// Run the path backward (`true`) or forward again (`false`).
+    ///
+    /// The path first comes to a stop as for [`halt`](Self::halt), then
+    /// moves back along the moves it has traversed — through the same
+    /// look-ahead, with the programmed feeds and the feed override — as far
+    /// as the start of the program (or of what
+    /// [`discard_history`](Self::discard_history) has left), where it waits
+    /// in [`IplState::Paused`]. Switching back to forward stops it again
+    /// and resumes the program from where the path then is.
+    ///
+    /// While the path runs backward
+    ///
+    /// * dwells and synchronized events are not executed and switch points
+    ///   not reported; on the way forward again, everything the program had
+    ///   already passed before it was turned around is skipped the same way
+    ///   (it has been reported once) — the path still comes to rest where a
+    ///   dwell or an event stops it, but goes on at once. A dwell that was
+    ///   interrupted by the turn is run again in full, unless the path
+    ///   never left its place;
+    /// * [`IplOutput::reverse`] is set, and [`IplOutput::s_total`] and
+    ///   [`IplOutput::progress`] decrease;
+    /// * [`planned_segments`](Self::planned_segments) is the plan of the
+    ///   way back;
+    /// * [`append`](Self::append) and
+    ///   [`discard_history`](Self::discard_history) are not available.
+    ///
+    /// Halt, override and single-step work in both directions. The cycle in
+    /// which the direction changes plans the way back or restores the
+    /// program, and allocates.
+    pub fn set_reverse(&mut self, on: bool) {
+        if self.state != IplState::Idle {
+            self.reverse_request = on;
+        }
+    }
+
+    /// Whether the path is currently traversed backward (the direction
+    /// actually in effect, which follows [`set_reverse`](Self::set_reverse)
+    /// once the path has stopped).
+    pub fn is_reverse(&self) -> bool {
+        self.forward.is_some()
     }
 
     /// Feed override factor (1.0 = 100%). Values below 0.5% snap to 0,
@@ -467,11 +838,27 @@ impl Interpolator {
         self.total_length
     }
 
+    /// The look-ahead plan of the loaded program, one entry per move in
+    /// path order (see [`PlannedSegment`]). Empty before a program is
+    /// loaded.
+    pub fn planned_segments(&self) -> &[PlannedSegment] {
+        &self.plan
+    }
+
     /// Start point of the loaded path: the start of the program's first move,
     /// available immediately after [`load`](Self::load) and before the first
     /// cycle. `[0, 0, 0]` when the program contains no move.
     pub fn start_position(&self) -> PathPoint {
         self.first_move().map_or([0.0; 3], |mv| mv.geo.start())
+    }
+
+    /// Completed path length in the forward direction, including progress
+    /// into the current move ([`IplOutput::s_total`]).
+    fn forward_s_total(&self) -> f64 {
+        match &self.forward {
+            Some(f) => f.s_total + f.s_start - (self.s_done + self.s_local),
+            None => self.s_done + self.s_local,
+        }
     }
 
     /// Auxiliary axis positions at the start of the loaded path, in decoder
@@ -514,19 +901,29 @@ impl Interpolator {
                 "max_normal_acceleration must be a finite number greater than or equal to zero (got {a_n})"
             )));
         }
-        if let Some((i, v)) = self
-            .aux_max_velocity
-            .iter()
-            .enumerate()
-            .find(|(_, v)| !v.is_finite() || **v < 0.0)
-        {
-            return Err(CncError::Interpolator(format!(
-                "auxiliary axis {i} velocity limit must be a finite number greater than or equal to zero (got {v})"
-            )));
+        // Axis limits: infinity means "no limit"; zero is a limit no move
+        // of that axis can meet (refused with its source line at load).
+        let path = self.axis_limits.path.iter().map(|l| ("path axis", l));
+        let aux = self.axis_limits.aux.iter().map(|l| ("auxiliary axis", l));
+        for (i, (kind, l)) in path.enumerate().chain(aux.enumerate()) {
+            for (what, v) in [
+                ("velocity limit", l.max_velocity),
+                ("acceleration limit", l.max_acceleration),
+                ("jerk limit", l.max_jerk),
+                ("velocity-jump limit", l.max_velocity_jump),
+            ] {
+                if v.is_nan() || v < 0.0 {
+                    return Err(CncError::Interpolator(format!(
+                        "{kind} {i} {what} must be a number greater than or equal to zero (got {v})"
+                    )));
+                }
+            }
         }
+        // (an infinite junction deviation leaves corners to the velocity-jump
+        // limits)
         if !self.lookahead.accel_margin.is_finite()
             || self.lookahead.accel_margin <= 0.0
-            || !self.lookahead.junction_deviation.is_finite()
+            || self.lookahead.junction_deviation.is_nan()
             || self.lookahead.junction_deviation < 0.0
         {
             return Err(CncError::Interpolator(format!(
@@ -538,7 +935,8 @@ impl Interpolator {
     }
 
     fn effective_override(&self) -> f64 {
-        if self.halted {
+        // (a change of direction waits for the path to stand still)
+        if self.halted || self.reverse_request != self.forward.is_some() {
             0.0
         } else {
             self.override_pct
@@ -583,7 +981,26 @@ impl Interpolator {
     }
 
     fn advance(&mut self) -> Result<(), CncError> {
+        // (what `load` or `append` has fired and no cycle has reported yet
+        // belongs to the way forward: the turn waits for that cycle)
+        if self.reverse_request != self.forward.is_some()
+            && matches!(
+                self.state,
+                IplState::Paused | IplState::StepHold | IplState::Dwelling | IplState::Finished
+            )
+            && self.pending_events.is_empty()
+            && self.pending_switches.is_empty()
+        {
+            if self.forward.is_none() {
+                self.enter_reverse()?;
+            } else {
+                self.leave_reverse();
+            }
+        }
         let ovr = self.effective_override();
+        if self.pending.active {
+            self.try_adopt(ovr)?;
+        }
 
         match self.state {
             IplState::Idle | IplState::Finished => {}
@@ -644,7 +1061,7 @@ impl Interpolator {
 
         match self.state {
             IplState::Running => self.step_running(ovr)?,
-            IplState::Pausing => self.step_pausing()?,
+            IplState::Pausing => self.step_pausing(self.cycle_time)?,
             _ => {}
         }
 
@@ -653,15 +1070,201 @@ impl Interpolator {
 
     // --- internals -------------------------------------------------------
 
+    /// Take the plan of an appended piece into use, if the path can follow
+    /// it from its current state.
+    fn try_adopt(&mut self, ovr: f64) -> Result<(), CncError> {
+        if self.forward.is_some() {
+            return Ok(());
+        }
+        match self.state {
+            IplState::Running => {
+                // The running profile aims at the previous plan's exit
+                // velocity; it has to be led over to the new one.
+                if ovr <= 0.0 {
+                    return Ok(());
+                }
+                let handled = (self.traj_override, self.traj_single_step);
+                self.swap_pending();
+                if !self.plan_move_traj(ovr, true)? {
+                    // Not from here: the plan in force goes on, and an
+                    // override change of this cycle is still to be dealt
+                    // with under it.
+                    self.swap_pending();
+                    (self.traj_override, self.traj_single_step) = handled;
+                    return Ok(());
+                }
+            }
+            IplState::Finished => {
+                self.swap_pending();
+                self.pending.active = false;
+                self.state = IplState::Running; // enter_next refines this
+                return self.enter_next(ovr);
+            }
+            // At standstill, or braking to one: nothing depends on the
+            // plan's exit velocities.
+            _ => self.swap_pending(),
+        }
+        self.pending.active = false;
+        Ok(())
+    }
+
+    /// Exchange the plan in force and the pending one.
+    fn swap_pending(&mut self) {
+        let p = &mut self.pending;
+        core::mem::swap(&mut self.plan, &mut p.plan);
+        core::mem::swap(&mut self.seg_info, &mut p.seg_info);
+        core::mem::swap(&mut self.adopted_len, &mut p.queue_len);
+        core::mem::swap(&mut self.total_length, &mut p.total_length);
+    }
+
+    /// Where the path is in the plan: the move it is in and the position
+    /// in it, or the end of the last move it has completed. `None` before
+    /// the first move.
+    fn position_in_plan(&self) -> Option<(usize, f64)> {
+        // (during a dwell the cursor is already on what follows it)
+        if self.state != IplState::Dwelling && self.current_move().is_some() {
+            return Some((self.plan_pos, self.s_local));
+        }
+        let done = self.plan.partition_point(|p| p.queue_index < self.cursor);
+        (done > 0).then(|| (done - 1, self.plan[done - 1].length))
+    }
+
+    /// Turn around: replace the program by the way back along the moves
+    /// traversed so far. Only at standstill.
+    fn enter_reverse(&mut self) -> Result<(), CncError> {
+        let s_total = self.s_done + self.s_local;
+        let mut track = Vec::new();
+        let (mut first, mut first_end, mut s_start) = (0, s_total, 0.0);
+        if let Some((k, s)) = self.position_in_plan() {
+            let len = self.plan[k].length;
+            // (at the very start of a move there is nothing of it to go back)
+            let skip = s <= 1e-12 * (1.0 + len);
+            let count = if skip { k } else { k + 1 };
+            for seg in self.plan[..count].iter().rev() {
+                if let Some(GeoElem::Move(mv)) = self.queue.get(seg.queue_index) {
+                    track.push(GeoElem::Move(mv.reversed()));
+                }
+            }
+            first = count.saturating_sub(1);
+            first_end = if skip { s_total - s } else { s_total - s + len };
+            s_start = if skip { 0.0 } else { (len - s).max(0.0) };
+        }
+        let (plan, seg_info) = self.build_plan(&track, &PlanContext::default())?;
+        let forward = Forward {
+            queue: core::mem::replace(&mut self.queue, track),
+            plan: core::mem::replace(&mut self.plan, plan),
+            seg_info: core::mem::replace(&mut self.seg_info, seg_info),
+            adopted_len: self.adopted_len,
+            cursor: self.cursor,
+            plan_pos: self.plan_pos,
+            s_local: self.s_local,
+            s_done: self.s_done,
+            state: self.state,
+            dwell_remaining: self.dwell_remaining,
+            switch_pos: self.switch_pos,
+            last_src_line: self.last_src_line,
+            last_obj_no: self.last_obj_no,
+            first,
+            first_end,
+            s_total,
+            s_start,
+        };
+        // What has been reported so far is not reported again. (A dwell cut
+        // short by the turn sits just before the cursor and is repeated.)
+        let reached = if forward.state == IplState::Dwelling {
+            forward.cursor.saturating_sub(1)
+        } else {
+            forward.cursor
+        };
+        // (the count of reported switch points belongs to the move the
+        // path is in: past the end of the program, or between a dwell and
+        // the move after it, there is none)
+        let reported = match forward.queue.get(reached) {
+            Some(GeoElem::Move(_)) => forward.switch_pos,
+            _ => 0,
+        };
+        self.high_water = self.high_water.max((reached, reported));
+        self.forward = Some(Box::new(forward));
+        self.adopted_len = self.queue.len();
+        self.cursor = 0;
+        self.plan_pos = 0;
+        self.s_local = s_start;
+        self.s_done = 0.0;
+        self.v_s = 0.0;
+        self.a_s = 0.0;
+        self.switch_pos = 0;
+        self.state = IplState::Paused;
+        Ok(())
+    }
+
+    /// Turn forward again: restore the program at the place the way back
+    /// has led to. Only at standstill.
+    fn leave_reverse(&mut self) {
+        let Some(fwd) = self.forward.take() else {
+            return;
+        };
+        let fwd = *fwd;
+        let moved = self.s_done + self.s_local - fwd.s_start;
+        let at = self.position_in_plan();
+        self.queue = fwd.queue;
+        self.plan = fwd.plan;
+        self.seg_info = fwd.seg_info;
+        self.adopted_len = fwd.adopted_len;
+        self.v_s = 0.0;
+        self.a_s = 0.0;
+        match at {
+            Some((r, s_rev)) if moved > 1e-12 && r <= fwd.first => {
+                // Reverse move r is forward move `first - r`, backward.
+                let mut f = fwd.first - r;
+                let mut end = fwd.first_end;
+                for seg in &self.plan[f + 1..=fwd.first] {
+                    end -= seg.length;
+                }
+                let len = self.plan[f].length;
+                let mut s = (len - s_rev).clamp(0.0, len);
+                if s >= len * (1.0 - 1e-12) && f < fwd.first {
+                    // At a junction: the start of the move that follows.
+                    f += 1;
+                    end += self.plan[f].length;
+                    s = 0.0;
+                }
+                self.cursor = self.plan[f].queue_index;
+                self.plan_pos = f;
+                self.s_local = s;
+                self.s_done = end - self.plan[f].length;
+                self.switch_pos = 0;
+                self.state = IplState::Paused;
+                self.note_current_move();
+            }
+            _ => {
+                // The path never left the place where it was turned around.
+                self.cursor = fwd.cursor;
+                self.plan_pos = fwd.plan_pos;
+                self.s_local = fwd.s_local;
+                self.s_done = fwd.s_done;
+                self.state = fwd.state;
+                self.dwell_remaining = fwd.dwell_remaining;
+                self.switch_pos = fwd.switch_pos;
+                self.last_src_line = fwd.last_src_line;
+                self.last_obj_no = fwd.last_obj_no;
+            }
+        }
+    }
+
+    /// The program in its forward direction.
+    fn forward_queue(&self) -> &[GeoElem] {
+        self.forward.as_ref().map_or(&self.queue, |f| &f.queue)
+    }
+
     fn first_move(&self) -> Option<&GeoMove> {
-        self.queue.iter().find_map(|e| match e {
+        self.forward_queue().iter().find_map(|e| match e {
             GeoElem::Move(m) => Some(m),
             _ => None,
         })
     }
 
     fn current_move(&self) -> Option<&GeoMove> {
-        match self.queue.get(self.cursor) {
+        match self.queue[..self.adopted_len].get(self.cursor) {
             Some(GeoElem::Move(m)) => Some(m),
             _ => None,
         }
@@ -697,7 +1300,7 @@ impl Interpolator {
     /// result reachable too.
     fn reachable_exit(&self, desired: f64, limit: f64, dist: f64) -> Option<f64> {
         let seg = &self.plan[self.plan_pos];
-        let (accel, decel, j_max) = (seg.accel, seg.decel, self.limits.max_jerk);
+        let (accel, decel, j_max) = (seg.accel, seg.decel, seg.jerk);
         let (v, a) = (self.v_s, self.a_s);
         let fits = |vt: f64| settle_distance(v, a, vt, accel, decel, j_max) <= dist;
         let search = |reachable: f64| {
@@ -735,16 +1338,34 @@ impl Interpolator {
     /// the next move. `self.cursor` must point at the element to enter.
     fn enter_next(&mut self, ovr: f64) -> Result<(), CncError> {
         loop {
-            match self.queue.get(self.cursor) {
+            match self.queue[..self.adopted_len].get(self.cursor) {
+                None if self.pending.active && self.forward.is_none() => {
+                    // The end of the plan, at rest, with an appended piece
+                    // waiting: carry on with it.
+                    self.swap_pending();
+                    self.pending.active = false;
+                }
                 None => {
-                    self.state = IplState::Finished;
+                    // The way back ends at the start of the program, where
+                    // the path waits to be sent forward again.
+                    self.state = if self.forward.is_some() {
+                        IplState::Paused
+                    } else {
+                        IplState::Finished
+                    };
                     self.v_s = 0.0;
                     self.a_s = 0.0;
                     return Ok(());
                 }
                 Some(GeoElem::Event(e)) => {
-                    self.pending_events.push(e.clone());
+                    // (not again, if the path has been here before)
+                    if self.cursor >= self.high_water.0 {
+                        self.pending_events.push(e.clone());
+                    }
                     self.last_src_line = e.src_line;
+                    self.cursor += 1;
+                }
+                Some(GeoElem::Dwell { .. }) if self.cursor < self.high_water.0 => {
                     self.cursor += 1;
                 }
                 Some(GeoElem::Dwell { seconds, src_line }) => {
@@ -762,22 +1383,28 @@ impl Interpolator {
                     }
                     debug_assert_eq!(self.plan[self.plan_pos].queue_index, self.cursor);
                     self.s_local = 0.0;
-                    self.a_s = 0.0;
                     self.switch_pos = 0;
                     // Hold only at standstill: if single-step was switched on
                     // too late to stop at this boundary, carry on and stop at
                     // the end of this segment instead.
                     if self.single_step && self.v_s <= EPS_V {
                         self.v_s = 0.0;
+                        self.a_s = 0.0;
                         self.note_current_move();
                         self.state = IplState::StepHold;
                     } else if ovr <= 0.0 {
                         self.v_s = 0.0;
+                        self.a_s = 0.0;
                         self.note_current_move();
                         self.state = IplState::Paused;
-                    } else {
-                        self.plan_move_traj(ovr, false)?;
+                    } else if self.plan_move_traj(ovr, false)? {
                         self.state = IplState::Running;
+                    } else {
+                        // No way on at speed from here: stop, and start
+                        // again from standstill (`advance` resumes a
+                        // paused path by itself).
+                        self.plan_stop_traj()?;
+                        self.state = IplState::Pausing;
                     }
                     return Ok(());
                 }
@@ -793,15 +1420,21 @@ impl Interpolator {
     /// the new target cannot be reached from the current state, that
     /// trajectory is kept as it is instead (it ends at the end of its span,
     /// where the new conditions are then picked up).
-    fn plan_move_traj(&mut self, ovr: f64, retarget: bool) -> Result<(), CncError> {
+    ///
+    /// Returns whether a trajectory was started. Without `retarget` one
+    /// always is, with a single exception: a span entered on the carried
+    /// plan, with an acceleration the plain plan cannot take up, whose
+    /// continuation the generator does not find — the caller then has to
+    /// stop the path (see `enter_next`).
+    fn plan_move_traj(&mut self, ovr: f64, retarget: bool) -> Result<bool, CncError> {
         let pos = self.plan_pos;
         let info = self.seg_info[pos];
         let (seg_len, v_cap) = (self.plan[pos].length, self.plan[pos].v_cap);
         self.note_current_move();
         let src_line = self.last_src_line;
-        // The acceleration limits are the same over the whole span.
+        // The acceleration and jerk limits are the same over the whole span.
         let (accel, decel) = (self.plan[pos].accel, self.plan[pos].decel);
-        let j_max = self.limits.max_jerk;
+        let j_max = self.plan[pos].jerk;
         let (v, a) = (self.v_s, self.a_s);
         // These are now dealt with, whether or not a new trajectory results.
         self.traj_override = ovr;
@@ -878,22 +1511,80 @@ impl Interpolator {
             // span; the rest is worked off in the next one.
         }
 
+        let plain_fits = settle_distance(v, a, desired, accel, decel, j_max) <= dist;
+
+        // The carried plan: the span ends in a state with acceleration,
+        // which the next span takes up. Taken where it fits under the
+        // cruise caps as the override leaves them — and in any case where
+        // the plain exit is out of reach, as it is on a braking ramp that
+        // was planned to run on through the span's ends.
+        let (v_carry, a_carry) = (self.plan[end].v_carry, self.plan[end].a_carry);
+        if !stop_at_end
+            && end == info.span_end
+            && (v_carry != end_v_exit || a_carry != 0.0)
+            && end + 1 < self.plan.len()
+        {
+            let within_caps = if a_carry < 0.0 {
+                v_carry + a_carry * a_carry / (2.0 * j_max) <= v_max
+            } else {
+                let next = &self.plan[end + 1];
+                let v_max_next = (next.v_cap * ovr).min(self.seg_info[end + 1].v_limit);
+                v_carry <= v_max && v_carry + a_carry * a_carry / (2.0 * next.jerk) <= v_max_next
+            };
+            if (within_caps || !plain_fits)
+                && self.start_carried_traj(end, remaining, v_ceiling, (v_carry, a_carry))
+            {
+                return Ok(true);
+            }
+            // A span entered on a braking ramp that was planned to run on
+            // through it has that ramp to follow and nothing else: the
+            // plain plan cannot be reached from there. If the generator
+            // does not find the ramp's next piece, the one safe way on is
+            // to stop (which the ramp always leaves room for) and to set
+            // off again from standstill.
+            if !plain_fits
+                && !retarget
+                && self.s_local == 0.0
+                && pos > 0
+                && self.seg_info[pos - 1].committed
+                && (v, a) == (self.plan[pos - 1].v_carry, self.plan[pos - 1].a_carry)
+            {
+                return Ok(false);
+            }
+        }
+
         // Exit velocity: the planned one, limited to the cruise cap — or
         // the nearest one the current state can reach in the distance left.
-        let v_exit = if settle_distance(v, a, desired, accel, decel, j_max) <= dist {
+        let v_exit = if plain_fits {
             desired
         } else if retarget {
             // Out of reach from here (typically: already in the final ramp
             // of the running profile, which leaves no slack at all).
             match self.reachable_exit(desired, end_v_exit, dist) {
                 Some(v_exit) if !stop_at_end => v_exit,
-                _ => return Ok(()),
+                _ => return Ok(false),
             }
         } else if stop_at_end {
             0.0
+        } else if let Some(v_exit) = self.reachable_exit(desired, self.seg_info[end].v_safe, dist) {
+            // The span was entered faster than its exit velocity allows
+            // for (with acceleration, on the carried plan, or after the
+            // override was lowered): the nearest velocity it can be left
+            // at that is safe there.
+            v_exit
+        } else if a > 0.0 {
+            // Entered with more acceleration than can be brought to zero
+            // within the span: the way out the plan has checked is to take
+            // it back at once and carry the rest on into the next span.
+            // (Not faster than the plan reckoned with, so that the state
+            // this ends in is none it has not checked.) If even that is
+            // not to be had, the path stops.
+            let jerk = j_max * self.lookahead.accel_margin.min(CARRY_MARGIN);
+            let state = bang(v, a, dist, 0.0, jerk);
+            return Ok(state.1 > 0.0 && self.start_carried_traj(end, remaining, v_ceiling, state));
         } else {
-            // Cannot happen while spans are entered at or below their
-            // planned velocity; get as close as possible.
+            // Cannot happen while spans are entered as planned; get as
+            // close as possible.
             self.reachable_exit(desired, f64::INFINITY, dist)
                 .unwrap_or(v)
         };
@@ -924,26 +1615,106 @@ impl Interpolator {
         end: usize,
         slowing: bool,
         v_exit: f64,
-    ) -> Result<(), CncError> {
+    ) -> Result<bool, CncError> {
         match self.calculate(src_line) {
             Ok(()) => {
                 self.traj_end = end;
                 self.traj_s_offset = 0.0;
                 self.slowing = slowing;
                 self.planned_v_exit = v_exit;
-                Ok(())
+                self.planned_a_exit = 0.0;
+                Ok(true)
             }
-            Err(_) if retarget => Ok(()),
+            Err(_) if retarget => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Try a profile from the current state to the end of plan segment
+    /// `end`, `remaining` ahead, arriving in the carried state
+    /// `(velocity, acceleration)`. Makes it the running trajectory and
+    /// returns `true` if the generator finds one that goes there directly.
+    ///
+    /// Whether the state is within reach is not known beforehand. Asked for
+    /// one that is not, the generator still answers — with a profile that
+    /// overshoots the end and returns, backs up for a run-up, or brakes to
+    /// a standstill short of the end and takes its run-up from there; such
+    /// an answer is told by its velocity changing sign, and dropped.
+    fn start_carried_traj(
+        &mut self,
+        end: usize,
+        remaining: f64,
+        v_ceiling: f64,
+        (v_carry, a_carry): (f64, f64),
+    ) -> bool {
+        let seg = &self.plan[self.plan_pos];
+        let (accel, decel, j_max) = (seg.accel, seg.decel, seg.jerk);
+        let (start, target) = (self.s_local, self.s_local + remaining);
+        // The generator wants room under its velocity limit for the ramp
+        // that builds a target deceleration up.
+        let v_before = if a_carry < 0.0 {
+            (v_carry + a_carry * a_carry / (2.0 * j_max)) * (1.0 + 1e-9)
+        } else {
+            v_carry
+        };
+        if a_carry > accel || a_carry < -decel || remaining.is_nan() || remaining <= 0.0 {
+            return false;
+        }
+        #[cfg(test)]
+        if self.carried_fault && self.a_s < 0.0 {
+            return false;
+        }
+        self.input.control_interface = ControlInterface::Position;
+        self.input.current_position[0] = start;
+        self.input.current_velocity[0] = self.v_s;
+        self.input.current_acceleration[0] = self.a_s;
+        self.input.target_position[0] = target;
+        self.input.target_velocity[0] = v_carry;
+        self.input.target_acceleration[0] = a_carry;
+        self.input.max_velocity[0] = v_ceiling.max(v_before);
+        self.set_accel_limits(accel, decel);
+        self.input.max_jerk[0] = j_max;
+        if !matches!(
+            self.otg.calculate(&self.input, &mut self.traj_next),
+            Ok(RuckigResult::Working) | Ok(RuckigResult::Finished)
+        ) {
+            return false;
+        }
+        if lowest_velocity(&self.traj_next) < -EPS_V {
+            return false;
+        }
+        let tol = 1e-9 * (1.0 + target.abs());
+        let range = self.traj_next.get_position_extrema()[0];
+        if !(range.min >= start - tol && range.max <= target + tol) {
+            return false;
+        }
+        core::mem::swap(&mut self.traj, &mut self.traj_next);
+        self.traj_time = 0.0;
+        self.traj_end = end;
+        self.traj_s_offset = 0.0;
+        self.slowing = false;
+        self.planned_v_exit = v_carry;
+        self.planned_a_exit = a_carry;
+        true
     }
 
     /// Plan an immediate jerk-limited stop from the current state
     /// (velocity control interface; position is unconstrained).
     fn plan_stop_traj(&mut self) -> Result<(), CncError> {
         let src_line = self.last_src_line;
-        let decel = self.current_decel();
-        self.stop_decel = decel;
+        let (decel, mut jerk) = self.current_stop_limits();
+        (self.stop_decel, self.stop_jerk) = (decel, jerk);
+        // A stop that has run on into a move with a lower jerk limit may be
+        // braking harder than that limit can take back before standstill:
+        // the generator would then run the velocity through zero and return.
+        // Such a stop ends with the least jerk that still ends it at rest
+        // (never more than the stop was running with).
+        if self.a_s < 0.0 {
+            let needed = self.a_s * self.a_s / (2.0 * self.v_s.max(f64::MIN_POSITIVE));
+            if needed > jerk {
+                jerk = (needed * (1.0 + 1e-9)).min(self.limits.max_jerk.max(jerk));
+            }
+        }
         self.input.control_interface = ControlInterface::Velocity;
         self.input.current_position[0] = self.s_local;
         self.input.current_velocity[0] = self.v_s;
@@ -953,18 +1724,35 @@ impl Interpolator {
         // Braking to a stop: the deceleration limit is the binding one, and
         // the velocity interface reads it from `max_acceleration`.
         self.set_accel_limits(decel, decel);
-        self.input.max_jerk[0] = self.limits.max_jerk;
+        self.input.max_jerk[0] = jerk;
         self.calculate(src_line)?;
         self.traj_s_offset = 0.0;
         self.slowing = false;
         Ok(())
     }
 
-    /// The deceleration limit in force where the path currently is.
-    fn current_decel(&self) -> f64 {
+    /// The deceleration and jerk limits in force where the path currently
+    /// is.
+    fn current_stop_limits(&self) -> (f64, f64) {
         self.plan
             .get(self.plan_pos)
-            .map_or(self.limits.max_acceleration, |p| p.decel)
+            .map_or((self.limits.max_acceleration, self.limits.max_jerk), |p| {
+                (p.decel, p.jerk)
+            })
+    }
+
+    /// Step from the current move to the next planned one, reporting the
+    /// fly-by events that lie between them.
+    fn cross_to_next_move(&mut self) {
+        let next = self.plan[self.plan_pos + 1].queue_index;
+        for q in self.cursor + 1..next {
+            if let (GeoElem::Event(e), true) = (&self.queue[q], q >= self.high_water.0) {
+                self.pending_events.push(e.clone());
+            }
+        }
+        self.cursor = next;
+        self.plan_pos += 1;
+        self.switch_pos = 0;
     }
 
     /// Hand rsruckig this segment's acceleration and deceleration limits.
@@ -983,28 +1771,7 @@ impl Interpolator {
     }
 
     fn calculate(&mut self, src_line: usize) -> Result<(), CncError> {
-        fn found<E>(result: &Result<RuckigResult, E>) -> bool {
-            matches!(
-                result,
-                Ok(RuckigResult::Working) | Ok(RuckigResult::Finished)
-            )
-        }
-        let mut result = self.otg.calculate(&self.input, &mut self.traj_next);
-        // A state that lies exactly on the boundary between two profile
-        // shapes (a stop requested in the very cycle a ramp reaches its
-        // acceleration limit; a new target for a state in the last jerk
-        // phase of the running profile) can be rejected by the generator
-        // for both shapes, by a rounding error. Starting a hair off that
-        // boundary is a change far below the resolution of the limits, and
-        // has a solution.
-        let a = self.input.current_acceleration[0];
-        for nudge in [1e-9, 1e-7] {
-            if found(&result) || a == 0.0 {
-                break;
-            }
-            self.input.current_acceleration[0] = a * (1.0 - nudge);
-            result = self.otg.calculate(&self.input, &mut self.traj_next);
-        }
+        let result = self.otg.calculate(&self.input, &mut self.traj_next);
         match result {
             Ok(RuckigResult::Working) | Ok(RuckigResult::Finished) => {
                 core::mem::swap(&mut self.traj, &mut self.traj_next);
@@ -1051,7 +1818,7 @@ impl Interpolator {
             // on through any junction to an adjacent move (the look-ahead
             // guarantees it fits before a dwell, an event or the program end).
             let may_cross = if self.state == IplState::Pausing {
-                matches!(self.queue.get(self.cursor + 1), Some(GeoElem::Move(_)))
+                !self.seg_info[self.plan_pos].stop_after
             } else {
                 self.plan_pos < self.traj_end
             };
@@ -1063,9 +1830,7 @@ impl Interpolator {
             s -= seg_len;
             self.traj_s_offset += seg_len;
             self.s_done += seg_len;
-            self.cursor += 1;
-            self.plan_pos += 1;
-            self.switch_pos = 0;
+            self.cross_to_next_move();
             self.note_current_move();
         }
         self.s_local = s;
@@ -1094,21 +1859,24 @@ impl Interpolator {
             while self.plan_pos < self.traj_end {
                 self.fire_switches(f64::INFINITY);
                 self.s_done += self.current_plan().length;
-                self.cursor += 1;
-                self.plan_pos += 1;
-                self.switch_pos = 0;
+                self.cross_to_next_move();
             }
             self.note_current_move();
             let seg_len = self.current_plan().length;
             self.s_local = seg_len;
             self.v_s = self.planned_v_exit;
-            self.a_s = 0.0;
+            self.a_s = self.planned_a_exit;
             self.update_pose();
             self.fire_switches(f64::INFINITY);
             self.s_done += seg_len;
             self.s_local = 0.0;
             self.cursor += 1;
             self.enter_next(ovr)?;
+            if self.state == IplState::Pausing {
+                // Stopping from the speed the span was entered with: the
+                // rest of the cycle belongs to the stop.
+                return self.step_pausing(t);
+            }
             if self.state != IplState::Running {
                 // Dwell / hold / pause / finished: the leftover cycle time is
                 // absorbed by that state (bounded by one cycle).
@@ -1125,10 +1893,43 @@ impl Interpolator {
         Ok(())
     }
 
-    fn step_pausing(&mut self) -> Result<(), CncError> {
-        let duration = self.traj.get_duration();
-        self.traj_time = (self.traj_time + self.cycle_time).min(duration);
-        let (s, v, a) = self.sample_traj();
+    /// Follow the stop profile for the time `dt`.
+    fn step_pausing(&mut self, mut dt: f64) -> Result<(), CncError> {
+        let mut duration = self.traj.get_duration();
+        let mut start = self.traj_time;
+        self.traj_time = (start + dt).min(duration);
+        let (mut s, mut v, mut a) = self.sample_traj();
+        // A stop that runs into a move with other limits (an `E` word, a
+        // weaker axis) brakes as that move was planned to from the very
+        // point where it enters it, neither harder nor - which could
+        // overrun a planned stop - more gently: the cycle is split there.
+        while self.leaves_stop_limits(s) {
+            let (mut before, mut after) = (start, self.traj_time);
+            for _ in 0..60 {
+                let mid = 0.5 * (before + after);
+                if mid <= before || mid >= after {
+                    break;
+                }
+                self.traj_time = mid;
+                let s_mid = self.sample_traj().0;
+                if self.leaves_stop_limits(s_mid) {
+                    after = mid;
+                } else {
+                    before = mid;
+                }
+            }
+            self.traj_time = after;
+            (s, v, a) = self.sample_traj();
+            self.advance_to(s);
+            self.v_s = v.max(0.0);
+            self.a_s = a;
+            dt -= after - start;
+            self.plan_stop_traj()?;
+            duration = self.traj.get_duration();
+            start = 0.0;
+            self.traj_time = dt.max(0.0).min(duration);
+            (s, v, a) = self.sample_traj();
+        }
         // The stop profile may run past the current move's end when the
         // junction there was a blend: `advance_to` walks into following moves.
         self.advance_to(s);
@@ -1137,11 +1938,10 @@ impl Interpolator {
         self.update_pose();
         self.fire_switches(self.s_local);
 
-        if self.traj_time < duration && self.current_decel() != self.stop_decel {
-            // The stop has run into a move with another deceleration limit
-            // (an `E` word): the rest of it must brake as that move was
-            // planned to, neither harder nor - which could overrun a planned
-            // stop - more gently.
+        if self.traj_time < duration
+            && self.current_stop_limits() != (self.stop_decel, self.stop_jerk)
+        {
+            // (a stop that began under the limits of another move)
             return self.plan_stop_traj();
         }
         if self.traj_time >= duration {
@@ -1152,17 +1952,40 @@ impl Interpolator {
         Ok(())
     }
 
+    /// Whether the running stop, at its trajectory position `s_traj`, is
+    /// past the end of the current move and in one with other stop limits.
+    fn leaves_stop_limits(&self, s_traj: f64) -> bool {
+        // (the comparison `advance_to` makes)
+        let s = (s_traj - self.traj_s_offset).max(self.s_local);
+        s > self.plan[self.plan_pos].length
+            && !self.seg_info[self.plan_pos].stop_after
+            && self
+                .plan
+                .get(self.plan_pos + 1)
+                .is_some_and(|next| (next.decel, next.jerk) != (self.stop_decel, self.stop_jerk))
+    }
+
     /// Report every switch point of the current move up to path position `s`
     /// that has not been reported yet. `f64::INFINITY` drains the move's list,
     /// which is what leaving the element does.
     fn fire_switches(&mut self, s: f64) {
         let mut fired = core::mem::take(&mut self.pending_switches);
         if let Some(GeoElem::Move(mv)) = self.queue.get(self.cursor) {
+            // Switch points the path has passed before it was run backward
+            // are not reported again.
+            let (reached, reported) = self.high_water;
+            let known = match self.cursor.cmp(&reached) {
+                core::cmp::Ordering::Less => usize::MAX,
+                core::cmp::Ordering::Equal => reported,
+                core::cmp::Ordering::Greater => 0,
+            };
             while let Some(sp) = mv.switch_points.get(self.switch_pos) {
                 if sp.position > s {
                     break;
                 }
-                fired.push(*sp);
+                if self.switch_pos >= known {
+                    fired.push(*sp);
+                }
                 self.switch_pos += 1;
             }
         }
@@ -1231,7 +2054,8 @@ impl Interpolator {
         out.aux_velocity.extend_from_slice(&self.aux_vel_now);
         out.src_line = self.last_src_line;
         out.obj_no = self.last_obj_no;
-        out.s_total = self.s_done + self.s_local;
+        out.s_total = self.forward_s_total();
+        out.reverse = self.forward.is_some();
         out.progress = if self.total_length > 0.0 {
             (out.s_total / self.total_length).min(1.0)
         } else {
@@ -1250,32 +2074,91 @@ impl Interpolator {
     }
 }
 
-/// Shortest distance in which the state `(v, a)` can reach velocity `vt`
-/// with zero acceleration, under the jerk limit `j_max` and the limits
-/// `accel` on speeding up and `decel` on slowing down.
-fn settle_distance(v: f64, a: f64, vt: f64, accel: f64, decel: f64, j_max: f64) -> f64 {
-    // The limit that rules a velocity change in the given direction
-    let limit = |up: bool| if up { accel } else { decel };
-    if a == 0.0 {
-        return ramp_distance(v, vt, limit(vt >= v), j_max);
+/// The lowest velocity a one-axis trajectory passes through.
+fn lowest_velocity(traj: &Trajectory<1>) -> f64 {
+    // Lowest velocity of a constant-jerk phase of duration `t`.
+    fn phase(t: f64, v: f64, a: f64, j: f64) -> f64 {
+        if t.is_nan() || t <= 0.0 {
+            return v;
+        }
+        let mut low = v.min(v + (a + 0.5 * j * t) * t);
+        if j > 0.0 && a < 0.0 && -a < j * t {
+            low = low.min(v - a * a / (2.0 * j));
+        }
+        low
     }
-    let t1 = a.abs() / j_max; // time to bring the acceleration to zero
-    let dv1 = 0.5 * a * t1; // velocity gained meanwhile
-    let v_nat = v + dv1;
-    if (vt - v_nat) * a > 0.0 {
-        // The target lies further along the way the acceleration already
-        // points. (v, a) is a point on the standard ramp that left
-        // v_virt = v − dv1 with zero acceleration t1 ago and has covered
-        // x_virt since; the rest of that ramp is the fastest way to vt.
-        let v_virt = v - dv1;
-        let x_virt = v_virt * t1 + a * t1 * t1 / 6.0;
-        ramp_distance(v_virt, vt, limit(a > 0.0).max(a.abs()), j_max) - x_virt
-    } else {
-        // First bring the acceleration to zero (arriving at v_nat), then
-        // ramp the other way.
-        let d1 = v * t1 + a * t1 * t1 / 3.0;
-        d1 + ramp_distance(v_nat, vt, limit(a < 0.0), j_max)
+    let mut low = f64::INFINITY;
+    for section in traj.get_profiles() {
+        let p = &section[0];
+        if p.brake.duration > 0.0 {
+            for i in 0..2 {
+                low = low.min(phase(
+                    p.brake.t[i],
+                    p.brake.v[i],
+                    p.brake.a[i],
+                    p.brake.j[i],
+                ));
+            }
+        }
+        for i in 0..7 {
+            low = low.min(phase(p.t[i], p.v[i], p.a[i], p.j[i]));
+        }
     }
+    low
+}
+
+/// Largest number of auxiliary axes any move of `queue` carries.
+fn aux_width(queue: &[GeoElem]) -> usize {
+    queue
+        .iter()
+        .filter_map(|e| match e {
+            GeoElem::Move(m) => Some(m.aux_start.len().max(m.aux_end.len())),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Upper bound of the switch points one cycle can cross: those of the move
+/// the path is in plus those of every following move the cycle can reach. A
+/// cycle covers at most the highest velocity ceiling times the cycle time,
+/// and has to traverse the moves in between completely.
+fn max_switches_per_cycle(
+    queue: &[GeoElem],
+    plan: &[PlannedSegment],
+    seg_info: &[SegInfo],
+    cycle_time: f64,
+) -> usize {
+    let count = |i: usize| match queue.get(plan[i].queue_index) {
+        Some(GeoElem::Move(m)) => m.switch_points.len(),
+        _ => 0,
+    };
+    let n = plan.len();
+    if (0..n).all(|i| count(i) == 0) {
+        return 0;
+    }
+    let reach = seg_info.iter().map(|i| i.v_limit).fold(0.0, f64::max) * cycle_time;
+    // Window first..=last: the moves reachable from `first`; `inner` is
+    // the length of the moves after `first` in it.
+    let (mut worst, mut in_window, mut inner, mut last) = (0, 0, 0.0, 0);
+    for first in 0..n {
+        if first == 0 || last < first {
+            last = first;
+            in_window = count(first);
+            inner = 0.0;
+        }
+        while last + 1 < n && inner < reach {
+            last += 1;
+            inner += plan[last].length;
+            in_window += count(last);
+        }
+        worst = worst.max(in_window);
+        in_window -= count(first);
+        if last > first {
+            inner -= plan[first + 1].length;
+        }
+    }
+    worst
 }
 
 #[cfg(test)]
@@ -1361,5 +2244,68 @@ mod tests {
             settle_distance(30.0, 0.0, 0.0, acc, dec, J)
                 > settle_distance(30.0, 0.0, 0.0, acc, acc, J)
         );
+    }
+
+    /// A run at 50 mm/s into a staircase of forty 0.2 mm blocks whose feed
+    /// falls to 5 mm/s: the carried plan brakes down it in one ramp.
+    fn falling_staircase() -> Interpolator {
+        let mut src = String::from("G1 X40 F50\n");
+        for k in 0..40 {
+            let feed = (25.0 + 2475.0 * (39 - k) as f64 / 39.0).sqrt();
+            src += &format!("X{:.3} F{feed:.3}\n", 40.0 + 0.2 * (k + 1) as f64);
+        }
+        let queue = crate::decoder::Decoder::decode_source(Default::default(), &src).unwrap();
+        let limits = PathLimits::new(50.0, 500.0, 5000.0, 500.0);
+        let mut ipl = Interpolator::new(limits, LookAhead::default(), Vec::new(), 0.001);
+        ipl.load(queue).unwrap();
+        ipl
+    }
+
+    #[test]
+    fn a_carried_ramp_that_finds_no_continuation_ends_in_a_controlled_stop() {
+        // Reference: the staircase is braked without a stop.
+        let mut ipl = falling_staircase();
+        let total = ipl.total_length();
+        let mut cycles = 0;
+        loop {
+            let out = ipl.cycle().unwrap();
+            assert!(matches!(out.state, IplState::Running | IplState::Finished));
+            cycles += 1;
+            if out.state == IplState::Finished {
+                break;
+            }
+        }
+
+        // With every continuation of a braking ramp refused, the path is
+        // inside the ramp with no profile that goes on: it stops within its
+        // limits, short of the end, and goes on from standstill.
+        let mut ipl = falling_staircase();
+        ipl.carried_fault = true;
+        let (mut stops, mut faulted) = (0, 0);
+        let mut prev = ipl.cycle().unwrap();
+        loop {
+            let out = ipl.cycle().unwrap();
+            assert!(out.path_velocity >= 0.0);
+            assert!(out.path_velocity <= 50.0 * (1.0 + 1e-9));
+            assert!(out.path_acceleration.abs() <= 500.0 * (1.0 + 1e-6));
+            let jerk = (out.path_acceleration - prev.path_acceleration).abs() / 0.001;
+            assert!(jerk <= 5000.0 * (1.0 + 1e-6), "jerk {jerk}");
+            let mean = 0.5 * (out.path_velocity + prev.path_velocity) * 0.001;
+            assert!((out.s_total - prev.s_total - mean).abs() <= 5e-6);
+            assert!(out.s_total <= total + 1e-9);
+            if out.state == IplState::Paused && prev.state != IplState::Paused {
+                assert_eq!(out.path_velocity, 0.0);
+                stops += 1;
+            }
+            faulted += 1;
+            assert!(faulted < 100_000, "the program does not finish");
+            if out.state == IplState::Finished {
+                assert!((out.s_total - total).abs() < 1e-9);
+                break;
+            }
+            prev = out;
+        }
+        assert!(stops > 0, "the fault was never met");
+        assert!(faulted > cycles);
     }
 }

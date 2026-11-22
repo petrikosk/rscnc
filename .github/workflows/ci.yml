@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 03:17 UTC: the long stress run and the fuzz smoke test
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      stress_cases:
+        description: Number of randomized stress cases to run
+        type: number
+        default: 20000
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check formatting (fuzz targets)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The fuzz crate is outside the workspace and only fuzzed on a
+      # schedule: lint it here so that an API change cannot break it unnoticed.
+      - name: Clippy (fuzz targets)
+        run: cargo clippy --manifest-path fuzz/Cargo.toml -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (debug)
+        run: cargo test --workspace
+      - name: Test (release)
+        run: cargo test --workspace --release
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the documentation
+        run: cargo doc --workspace --no-deps
+
+  bench-build:
+    name: Build benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the benchmarks
+        run: cargo bench --no-run -p rscnc
+
+  stress:
+    name: Stress (long randomized run)
+    # On push to main, on the weekly schedule and on manual dispatch
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RSCNC_STRESS_CASES: ${{ inputs.stress_cases || '20000' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run ${{ env.RSCNC_STRESS_CASES }} stress cases
+        run: cargo test --release -p rscnc --test stress -- --nocapture
+
+  fuzz-smoke:
+    name: Fuzz smoke test (${{ matrix.target }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lex, decode, pipeline]
+    env:
+      FUZZ_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # The sample programs seed the (empty) corpus.
+      - name: Fuzz for 60 seconds
+        run: |
+          mkdir -p "fuzz/corpus/$FUZZ_TARGET"
+          cargo fuzz run "$FUZZ_TARGET" \
+            "$PWD/fuzz/corpus/$FUZZ_TARGET" "$PWD/samples/gcode" \
+            -- -max_total_time=60
+      - name: Upload the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

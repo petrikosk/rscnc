@@ -13,6 +13,22 @@
 //! The interpolator runs rsruckig as a **1-DoF planner on the path parameter `s`**
 //! (arc length). Look-ahead computes junction velocities so segments blend without
 //! stopping; feed override retargets the profile instantly on any cycle.
+//!
+//! Where to start:
+//!
+//! - [`CncController`] ties the stages together: load a program text (or feed
+//!   it in pieces while the path runs), call `cycle` every control period.
+//! - [`decoder`] documents the G-code dialect: motion words, coordinate
+//!   systems, splines, variables and program flow.
+//! - [`preprocess`] holds the path transforms: tool radius correction,
+//!   corner rounding and smoothing, curvature velocity limit.
+//! - [`lookahead::LookAhead`] and [`types::AxisConfig`] hold the planning
+//!   parameters and the path and per-axis limits.
+//! - [`interpolator::Interpolator`] is the cyclic part: override, halt,
+//!   single-step, backward motion, streaming.
+//!
+//! Feeds are in units per **second** (`F50` is 50 mm/s), as in CODESYS
+//! SoftMotion.
 
 #![warn(missing_docs)]
 
@@ -39,14 +55,17 @@ pub mod prelude {
     pub use crate::error::{CncError, DecodeError, GcodeError};
     pub use crate::gcode::lexer::lex;
     pub use crate::geometry::{
-        ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment, SwitchPoint, SyncEvent,
+        ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment, SplineSeg, SwitchPoint, SyncEvent,
     };
     pub use crate::interpolator::{Interpolator, IplOutput, IplState};
     pub use crate::kinematics::{CartesianKinematics, Kinematics};
     pub use crate::lookahead::{LookAhead, PlannedSegment};
     pub use crate::preprocess::{
-        CornerRounding, CurvatureVelocityLimit, Pipeline, Preprocessor, ToolRadiusCorrection,
+        CornerRounding, CornerSmoothing, CurvatureVelocityLimit, Pipeline, Preprocessor,
+        ToolRadiusCorrection,
     };
     pub use crate::queue::GeoQueue;
-    pub use crate::types::{AxisConfig, PathAxes, PathLimits, PathPoint, WorkPlane};
+    pub use crate::types::{
+        AxisConfig, AxisLimit, AxisLimits, PathAxes, PathLimits, PathPoint, WorkPlane,
+    };
 }

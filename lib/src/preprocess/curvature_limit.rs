@@ -7,7 +7,7 @@
 
 use super::Preprocessor;
 use crate::error::PreprocessError;
-use crate::geometry::{GeoElem, Geometry, Segment};
+use crate::geometry::GeoElem;
 use crate::queue::GeoQueue;
 
 /// Curvature velocity limit preprocessor: clamps arc feeds so the normal
@@ -35,12 +35,9 @@ impl Preprocessor for CurvatureVelocityLimit {
     fn process(&mut self, mut queue: GeoQueue) -> Result<GeoQueue, PreprocessError> {
         for elem in queue.iter_mut() {
             if let GeoElem::Move(mv) = elem {
-                if let Geometry::Arc(_) = &mv.geo {
-                    let len = mv.geo.length();
-                    let kappa = mv.geo.curvature_at(0.0).max(mv.geo.curvature_at(len));
-                    if kappa > 0.0 {
-                        mv.feed = mv.feed.min((self.max_normal_acceleration / kappa).sqrt());
-                    }
+                let kappa = mv.geo.max_curvature();
+                if kappa > 0.0 {
+                    mv.feed = mv.feed.min((self.max_normal_acceleration / kappa).sqrt());
                 }
             }
         }

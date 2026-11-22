@@ -1,6 +1,6 @@
 [package]
 name = "rscnc"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Petri Koskinen"]
 edition = "2021"
 description = "CNC motion control layer (DIN 66025 G-code decoder, path preprocessing, jerk-limited look-ahead interpolator) on top of the rsruckig trajectory generator"
@@ -10,9 +10,24 @@ readme = "../README.md"
 keywords = ["cnc", "gcode", "motion", "trajectory", "interpolation"]
 categories = ["science::robotics", "algorithms"]
 
+# The benchmarks are Criterion's (benches/); without this, `cargo bench`
+# would also hand Criterion's options to the library's own (empty) libtest
+# bench harness, which rejects them.
+[lib]
+bench = false
+
 [dependencies]
-rsruckig = "3.1"
+rsruckig = "3.1.2"
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
 proptest = "1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "interpolator"
+harness = false

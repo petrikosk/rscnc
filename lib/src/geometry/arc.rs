@@ -124,6 +124,22 @@ impl ArcSeg {
         Self::from_center(plane, start, end, center, ccw, 1e-6 + radius * 1e-9)
     }
 
+    /// The same arc traversed from its end to its start.
+    pub fn reversed(&self) -> ArcSeg {
+        let (_, _, i2) = self.plane.axes();
+        let mut center = self.center;
+        center[i2] += self.helix_delta;
+        ArcSeg {
+            plane: self.plane,
+            center,
+            r_start: self.r_end,
+            r_end: self.r_start,
+            theta0: self.theta0 + self.sweep,
+            sweep: -self.sweep,
+            helix_delta: -self.helix_delta,
+        }
+    }
+
     /// Signed helix pitch per radian of sweep.
     #[inline]
     fn pitch(&self) -> f64 {

@@ -131,6 +131,18 @@ impl Preprocessor for CornerRounding {
     }
 
     fn process(&mut self, queue: GeoQueue) -> Result<GeoQueue, PreprocessError> {
+        // (a NaN radius would otherwise slip through every comparison and
+        // end up in the arc geometry)
+        if self.radius.is_nan() || self.radius < 0.0 {
+            return Err(PreprocessError::new(
+                "CornerRounding",
+                queue.front().map_or(0, GeoElem::src_line),
+                format!(
+                    "corner rounding radius must be a number greater than or equal to zero (got {})",
+                    self.radius
+                ),
+            ));
+        }
         let elems: Vec<GeoElem> = queue.into_iter().collect();
         let mut out: Vec<GeoElem> = Vec::with_capacity(elems.len());
         for elem in elems {
@@ -217,5 +229,30 @@ mod tests {
         let q = Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10 M8\nY10\n").unwrap();
         let out = CornerRounding::new(2.0).process(q).unwrap();
         assert_eq!(out.len(), 3); // move, event, move - unchanged
+    }
+
+    #[test]
+    fn degenerate_radius_is_refused_or_harmless() {
+        let decode = || Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nY10\n");
+        for bad in [f64::NAN, -1.0, f64::NEG_INFINITY] {
+            let err = CornerRounding::new(bad).process(decode().unwrap());
+            assert!(err.is_err(), "radius {bad} accepted");
+        }
+        // zero: nothing to round; infinite: as large as the legs allow
+        assert_eq!(
+            CornerRounding::new(0.0)
+                .process(decode().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+        let out = CornerRounding::new(f64::INFINITY)
+            .process(decode().unwrap())
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        for e in out.iter() {
+            let GeoElem::Move(m) = e else { panic!() };
+            assert!(m.geo.length().is_finite() && m.geo.length() > 0.0);
+        }
     }
 }

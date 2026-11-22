@@ -14,6 +14,8 @@ pub enum MotionMode {
     ArcCw,
     /// G3 - circular interpolation, counter-clockwise
     ArcCcw,
+    /// G5 - spline through the programmed points
+    Spline,
 }
 
 /// G90 / G91.
@@ -64,7 +66,7 @@ pub enum TrcMode {
 /// feed in internal units/s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModalState {
-    /// Active motion mode (G0/G1/G2/G3).
+    /// Active motion mode (G0/G1/G2/G3/G5).
     pub motion: MotionMode,
     /// Active work plane (G17/G18/G19).
     pub plane: WorkPlane,
@@ -102,10 +104,17 @@ pub struct ModalState {
     pub tool: u32,
     /// Active tool radius correction mode (G40/G41/G42).
     pub trc: TrcMode,
-    /// Programmed position of the path axes (after G92 offset), internal units.
+    /// Machine position of the path axes (what the queue's geometry is in),
+    /// internal units.
     pub position: [f64; 3],
-    /// G92 offset: programmed = machine + offset, i.e. machine = programmed - offset.
+    /// G92 shift, on top of the active work offset and the tool length:
+    /// machine = programmed − `g92_offset` + work offset (+ tool length on Z).
     pub g92_offset: [f64; 3],
+    /// Active work coordinate system: 0 for G54 … 5 for G59.
+    pub work_offset: usize,
+    /// Active tool length compensation along Z (G43), internal units; 0
+    /// when it is off (G49).
+    pub tool_length: f64,
     /// Auxiliary (non-path) axis programmed positions, internal units.
     pub aux_position: Vec<f64>,
     /// G92 offsets of the auxiliary axes.
@@ -135,6 +144,8 @@ impl ModalState {
             trc: TrcMode::default(),
             position: [0.0; 3],
             g92_offset: [0.0; 3],
+            work_offset: 0,
+            tool_length: 0.0,
             aux_position: vec![0.0; aux_axes],
             aux_g92_offset: vec![0.0; aux_axes],
         }

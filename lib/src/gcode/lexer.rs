@@ -86,7 +86,10 @@ fn whitespace_len(line: &str, i: usize) -> usize {
 }
 
 /// Lex one line into its `N` number (if it leads the block) and its words.
-fn lex_line(line: &str, src_line: usize) -> Result<(Option<u32>, Vec<Word>), GcodeError> {
+pub(crate) fn lex_line(
+    line: &str,
+    src_line: usize,
+) -> Result<(Option<u32>, Vec<Word>), GcodeError> {
     let bytes = line.as_bytes();
     let mut words = Vec::new();
     let mut number = None;

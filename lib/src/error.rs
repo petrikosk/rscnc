@@ -17,6 +17,14 @@ pub enum CncError {
     /// Runtime error in the interpolator.
     #[error("interpolator error: {0}")]
     Interpolator(String),
+    /// The program would move an axis beyond its software end position.
+    #[error("soft limit at source line {line}: {message}")]
+    SoftLimit {
+        /// 1-based source line of the offending move.
+        line: usize,
+        /// Which axis, where it would go and what its limit is.
+        message: String,
+    },
     /// Kinematic transform error.
     #[error("kinematics error: {0}")]
     Kinematics(#[from] KinError),

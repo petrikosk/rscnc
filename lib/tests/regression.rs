@@ -808,6 +808,7 @@ fn single_step_switched_on_in_the_last_jerk_phase_of_a_move() {
         let lookahead = LookAhead {
             junction_deviation: 0.01,
             accel_margin: 1.0,
+            ..LookAhead::default()
         };
         let mut ipl = Interpolator::new(lim, lookahead, vec![30.0], 0.0005);
         ipl.load(queue).unwrap();
@@ -831,4 +832,130 @@ fn single_step_switched_on_in_the_last_jerk_phase_of_a_move() {
     for at in 0..cycles {
         run(at);
     }
+}
+
+#[test]
+#[allow(clippy::excessive_precision)] // the inputs as they were met
+fn a_move_on_the_border_between_two_profile_types_is_interpolated() {
+    // A rest-to-rest move of the length 2·a³/j² just reaches the
+    // acceleration limit: the border between the profiles with and without
+    // a phase of constant acceleration. On it (and an ulp or so beyond it)
+    // rsruckig 3.1.1 finds no profile (calculator error in step 1) unless
+    // it is asked a hair off the border.
+    let slow = PathLimits::new(50.0, 500.0, 5000.0, 500.0); // 2·a³/j² = 10
+    let fast = PathLimits::new(200.0, 3000.0, 100_000.0, 2000.0); // 5.4
+    for (limits, from, to, cycles) in [
+        (&slow, 0.0, 10.000000000000004, 400),
+        (&slow, 4.2315545023694767, 14.2315545023694803, 400),
+        (&slow, 0.0, 10.0, 400),
+        (&slow, 0.0, 9.999999999999998, 400),
+        (&fast, 0.0, 5.4, 120),
+        (&fast, 0.0, 5.400000000000001, 120),
+        (&fast, 1.4605632494715692, 6.8605632494715758, 120),
+    ] {
+        let cfg = DecoderConfig {
+            start_position: [from, 0.0, 0.0],
+            ..Default::default()
+        };
+        let src = format!("G1 F3000 X{to:?}\n");
+        let queue = Decoder::decode_source(cfg, &src).unwrap();
+        let mut ipl = Interpolator::new(*limits, LookAhead::default(), Vec::new(), 0.001);
+        ipl.load(queue)
+            .unwrap_or_else(|e| panic!("{from} -> {to}: {e}"));
+        let mut out = ipl.output_buffer();
+        let mut n = 0;
+        while out.state != IplState::Finished {
+            ipl.cycle_into(&mut out).unwrap();
+            n += 1;
+            assert!(n < 1000);
+        }
+        assert!((cycles..=cycles + 2).contains(&n), "{from} -> {to}: {n}");
+        assert!((out.path_position[0] - to).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn a_halted_stop_takes_the_limits_of_a_move_from_where_it_enters_it() {
+    // The jerk limit of the X axis holds a move along X to 6000 mm/s³; a
+    // move at 30° to it may use 6000/cos 30° = 6928. Planned without a
+    // margin, the path leaves the first move with exactly the velocity it
+    // can still stop from within the second. A stop that ran on into the
+    // second move kept the jerk limit of the first until the end of that
+    // cycle, and came to the end of the second move a trace too fast: the
+    // position froze there and the velocity jumped to zero.
+    let limits = PathLimits::new(50.0, 1000.0, 10_000.0, 1000.0);
+    let x_jerk = AxisLimit {
+        max_jerk: 6000.0,
+        ..AxisLimit::UNLIMITED
+    };
+    let axis_limits = AxisLimits {
+        path: [x_jerk, AxisLimit::UNLIMITED, AxisLimit::UNLIMITED],
+        aux: Vec::new(),
+    };
+    let lookahead = LookAhead {
+        accel_margin: 1.0,
+        ..LookAhead::default()
+    };
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    let (j1, j2) = (6000.0, 6000.0 / cos);
+    // The second move is as long as a stop from `v` takes, the first as
+    // long as the ramp up to `v` (and a trace more).
+    let l2 = 0.135;
+    let v = (l2 * j2.sqrt()).powf(2.0 / 3.0);
+    let l1 = 1.0001 * v * (v / j1).sqrt();
+    let src = format!("G1 F50 X{l1:.6}\nX{:.6} Y{:.6}\n", l1 + l2 * cos, l2 * sin);
+    let load = || {
+        let queue = Decoder::decode_source(DecoderConfig::default(), &src).unwrap();
+        let mut ipl =
+            Interpolator::with_axis_limits(limits, lookahead.clone(), axis_limits.clone(), DT);
+        ipl.load(queue).unwrap();
+        ipl
+    };
+    let plan = load();
+    let plan = plan.planned_segments();
+    assert_eq!(plan.len(), 2);
+    assert!(
+        (plan[0].jerk - j1).abs() < 0.1 && (plan[1].jerk - j2).abs() < 0.1,
+        "{plan:?}"
+    );
+    assert!((plan[0].v_exit - v).abs() < 1e-3 * v, "{}", plan[0].v_exit);
+
+    let total = l1 + l2;
+    let mut halts_in_the_first_move = 0;
+    for at in 0..200 {
+        let mut ipl = load();
+        let mut prev = ipl.cycle().unwrap();
+        let mut halted_at = None;
+        for i in 1..5000 {
+            if i == at {
+                ipl.halt();
+                halted_at = Some(prev.s_total);
+            }
+            let out = ipl.cycle().unwrap();
+            // Progress matches the velocity: no freeze at a move end.
+            let mean = 0.5 * (out.path_velocity + prev.path_velocity) * DT;
+            assert!(
+                (out.s_total - prev.s_total - mean).abs() <= 0.2 * 10_000.0 * DT * DT * DT + 1e-9,
+                "halt at {at}, cycle {i}: step {} at a mean velocity of {}",
+                out.s_total - prev.s_total,
+                mean / DT
+            );
+            let jerk = (out.path_acceleration - prev.path_acceleration).abs() / DT;
+            assert!(jerk <= j2 * (1.0 + 1e-6), "halt at {at}, cycle {i}: {jerk}");
+            match out.state {
+                IplState::Paused => ipl.resume(),
+                IplState::Finished => {
+                    assert!((out.s_total - total).abs() < 1e-6);
+                    break;
+                }
+                _ => {}
+            }
+            assert!(i < 4999, "halt at {at}: the program does not finish");
+            prev = out;
+        }
+        if halted_at.is_some_and(|s| s > 0.0 && s < l1) {
+            halts_in_the_first_move += 1;
+        }
+    }
+    assert!(halts_in_the_first_move > 20, "{halts_in_the_first_move}");
 }

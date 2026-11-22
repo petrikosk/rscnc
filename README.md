@@ -6,9 +6,10 @@ after the CoDeSys SoftMotion CNC architecture:
 
 ```text
 G-code ──► Decoder ──► GeoQueue ──► Preprocessors ──► Interpolator ──► Kinematics ──► axis setpoints
-(text)     (modal      (lines,      (corner round,    (look-ahead +    (path space
-            state)      arcs,        tool radius       Ruckig 1-DoF     to axis
-                        events)      corr., ...)       s-profile)       space)
+(text)     (modal      (lines,      (tool radius      (look-ahead +    (path space
+            state,      arcs,        corr., corner     Ruckig 1-DoF     to axis
+            program     splines,     rounding /        s-profile)       space)
+            flow)       events)      smoothing, ...)
 ```
 
 The interpolator runs rsruckig as a **1-DoF planner on the path parameter `s`** (arc length):
@@ -23,10 +24,15 @@ state, which is exactly what Ruckig was built for.
 ## Features
 
 - **DIN 66025 decoder** — `G0 G1 G2 G3` (lines, arcs in all planes, IJK center and R radius
-  format, helical arcs), `G4` dwell, `G17/G18/G19` planes, `G40/G41/G42` tool radius
-  correction modes, `G70/G71` (+ `G20/G21`) units, `G90/G91`, `G92` preset, `F S T M`
-  words, `N` numbers, comments, block delete, `M2/M30` program end. Modal state machine,
-  strict semantic errors with source line numbers.
+  format, helical arcs), `G5` splines through programmed points, `G4` dwell, `G17/G18/G19`
+  planes, `G40/G41/G42` tool radius correction modes, `G43/G49` tool length compensation,
+  `G53` and `G54`…`G59` coordinate systems, `G25/G26` working area, `G70/G71`
+  (+ `G20/G21`) units, `G90/G91`, `G92` preset, `F S T M` words, `N` numbers, comments,
+  block delete, `M2/M30` program end. Modal state machine, strict semantic errors with
+  source line numbers.
+- **Variables and program flow** in the style of Fanuc Macro B — `#1 = [#2 + 3] * SIN[30]`,
+  computed words (`X[#1 * 2]`), `GOTO`, `IF … GOTO` / `IF … THEN`, `WHILE … DO … END`,
+  subprograms (`M98 P… K…` / `M99`), with a guard against programs that never end.
 - **CODESYS-compatible dynamics words** — `F` is the path velocity in units/**second**, `E`
   the maximum path acceleration (positive) or deceleration (negative), `FF`/`EF` the same
   pair for `G0` rapids, and `F<axis>`/`E<axis>` the limits of one auxiliary axis. All are
@@ -37,13 +43,20 @@ state, which is exactly what Ruckig was built for.
   Several fit in one block, they survive tool radius correction and corner rounding, and
   the interpolator reports each one in the cycle it is crossed.
 - **Generic N-axis** — 2 or 3 geometric path axes plus any number of auxiliary synchronized
-  axes (`A B C U V W ...`), which interpolate linearly over the path and cap the path
-  velocity so their own limits are never exceeded.
+  axes (`A B C U V W ...`), which interpolate linearly over the path.
+- **Per-axis limits** — velocity, acceleration and jerk limits of every machine axis are
+  kept on top of the path limits (a move's limits follow from the share each axis has in
+  it, the centripetal acceleration on curves included), plus an optional limit on the
+  velocity *step* an axis may take at a junction, and software end positions that refuse a
+  program before it runs.
 - **Look-ahead planner** — per-segment velocity caps (feed, machine cap, centripetal
   `v ≤ √(a_n/κ)`, aux-axis caps) plus Grbl-style junction-deviation corner velocities
   (auxiliary axes included; a polyline sampling a curve obeys the same centripetal budget
   as the arc it approximates) with backward/forward reachability passes that use the exact
-  jerk-limited ramp distance.
+  jerk-limited ramp distance. Where the velocity limit changes in many small steps — a
+  curve cut into pieces of different curvature, smoothed corners, a run of feed changes —
+  the plan **carries acceleration across span boundaries**, so the path brakes or
+  accelerates in one ramp instead of one S-curve per step.
 - **Jerk-limited interpolation** — one rsruckig `calculate()` per span, sampled with
   `Trajectory::at_time` under exact time bookkeeping (no cycle-quantization error at
   segment boundaries). Position, velocity and acceleration are continuous everywhere.
@@ -52,15 +65,28 @@ state, which is exactly what Ruckig was built for.
   `halt()` decelerates to a jerk-limited pause (velocity-interface stop that may safely
   cross blended segment boundaries), `resume()` retargets back, single-step mode stops at
   every segment end.
-- **Synchronized events** — M functions (with H parameter), spindle `S` and tool `T`
-  changes fire exactly once when the path crosses their program position (exact stop in v1).
+- **Backward motion** — `set_reverse(true)` stops the path and runs it back along what it
+  has traversed, through the same look-ahead and with override, halt and single-step;
+  forward again, the program resumes without repeating what it has already reported.
+- **Streaming** — more program can be appended while the path runs (`append_program`,
+  `Interpolator::append`): the look-ahead is extended over it and the path does not stop
+  at the seam. `discard_history` drops what lies behind, so a program fed in pieces does
+  not grow without bound.
+- **Synchronized events** — M functions, spindle `S` and tool `T` changes fire exactly once
+  when the path crosses their program position. They stop the path there, except the M
+  functions listed as *fly-by* (`DecoderConfig::fly_by_m`), which are reported while the
+  path runs through.
 - **Preprocessors** (composable `GeoQueue → GeoQueue` transforms):
   - `ToolRadiusCorrection` — 2D G41/G42 offsetting with exact line/line, line/arc, arc/arc
-    inner-corner intersection trimming, transition arcs on outer corners, lead-in/out moves
-    and gouge detection.
+    inner-corner intersection trimming, transition arcs on outer corners, lead-in/out moves,
+    and removal of contour details the tool does not fit into (a slot narrower than the
+    tool is passed over instead of cut into).
   - `CornerRounding` — inserts tangent fillet arcs between linear moves so the look-ahead
     can carry speed through corners.
-  - `CurvatureVelocityLimit` — clamps arc feeds to a centripetal-acceleration budget.
+  - `CornerSmoothing` — the `G64 P…` idea: quintic blends that stay within a tolerance of
+    the programmed corner and join the lines with continuous curvature.
+  - `CurvatureVelocityLimit` — clamps the feed on curved elements to a
+    centripetal-acceleration budget.
 - **Simulation-first** — `CncController` facade + `SimDriver` log for tests and SVG plots;
   real hardware goes behind the `AxisDriver` trait (fieldbus integration is future work).
 
@@ -86,7 +112,8 @@ fn main() -> Result<(), CncError> {
     );
 
     let mut pipeline = Pipeline::new(); // optionally .with(CornerRounding::new(1.0)) ...
-    cnc.load_program("G1 F1500 X20\nY20\nX0\nY0\nM30\n", DecoderConfig::default(), &mut pipeline)?;
+    // F is in mm/s
+    cnc.load_program("G1 F25 X20\nY20\nX0\nY0\nM30\n", DecoderConfig::default(), &mut pipeline)?;
 
     let mut driver = SimDriver::<3>::new(); // or your own AxisDriver impl
     loop {
@@ -104,7 +131,30 @@ fn main() -> Result<(), CncError> {
 ```
 
 Runtime control on the interpolator: `set_override(0.4)`, `halt()` / `resume()`,
-`set_single_step(true)` + `step()`.
+`set_single_step(true)` + `step()`, `set_reverse(true)`.
+
+### Feeding a program in pieces
+
+```rust,ignore
+cnc.load_program(first_piece, DecoderConfig::default(), &mut pipeline)?;
+loop {
+    let out = cnc.cycle(&mut driver)?;
+    if cnc.interpolator.remaining_length() < 50.0 {
+        if let Some(text) = next_piece() {
+            // decoded with the modal state the previous piece ended in
+            cnc.append_program(text, &mut pipeline)?;
+        }
+        cnc.interpolator.discard_history(100.0); // keep 100 mm for backward motion
+    }
+    if out.state == IplState::Finished { break; }
+}
+```
+
+The path does not stop at the seam between two pieces as long as the next one arrives
+before the path brakes for the end of the previous one. Preprocessors see each piece on its
+own (no rounding, smoothing or radius correction across a seam), and a ramp that crosses a
+seam does so in two S-curves. `append_program` and `discard_history` plan and allocate:
+call them beside the control cycle, not in it.
 
 ### Real-time use
 
@@ -158,8 +208,9 @@ mismatch (CAM output) is absorbed by linear spiral correction within `radius_tol
 cargo test
 ```
 
-- unit tests: lexer, modal decoder, arc geometry (all planes, helix, R format), look-ahead
-  rules, corner rounding tangency, tool radius offsets/trims/gouge detection
+- unit tests: lexer, modal decoder, expressions and program flow, arc and spline geometry,
+  look-ahead rules, corner rounding tangency, corner smoothing tolerance, tool radius
+  offsets/trims/loop removal (including random profiles that must never be cut into)
 - integration tests: full programs through the pipeline asserting kinematic limits via
   finite differences, exact endpoints (≤ 1e-8 mm), junction blending, override/pause/resume,
   event/dwell timing, single-step, aux-axis caps
@@ -167,34 +218,56 @@ cargo test
   point on the programmed path), exact endpoints
 - regression tests (`lib/tests/regression.rs`): one test per defect fixed so far — stalls,
   jolts, limit violations, rejected programs
-- stress test (`lib/tests/stress.rs`): random programs under random override / halt /
-  single-step actions across several limit sets and cycle times; the path motion must stay
-  one continuous jerk-limited profile within the programmed `E` limits, report every switch
+- feature tests: per-axis limits and fly-by events (`axis_limits.rs`), the G-code dialect
+  (`dialect.rs`), splines and smoothing (`spline.rs`), streaming (`streaming.rs`), backward
+  motion (`reverse.rs`), carried acceleration (`carry.rs`), and the zero-allocation cycle
+  (`allocation.rs`)
+- stress test (`lib/tests/stress.rs`): random programs — streamed in pieces or loaded whole
+  — under random override / halt / single-step / reverse actions across several limit sets
+  and cycle times; the path motion must stay one continuous jerk-limited profile within the
+  programmed `E` limits, the velocity caps and the per-axis limits, report every switch
   point once, and end exactly at the program end. `RSCNC_STRESS_CASES=100000 cargo test
   --release --test stress` runs a longer soak (`RSCNC_STRESS_FIRST` moves it to other seeds)
+- `cargo bench -p rscnc` runs the Criterion benchmarks; `fuzz/` holds cargo-fuzz targets
+  for the lexer, the decoder and the offline pipeline
 
 ## Scope and future work
 
-Implemented against the CoDeSys SoftMotion CNC feature model; not yet included (backlog):
-splines (G5), ellipses, 3D tool radius correction, subprograms/jumps, spline smoothing of
-corners, non-stopping ("fly-by") M events, streaming/windowed preprocessing for unbounded
-programs, backward move on path, fieldbus drivers (EtherCAT/CiA402), `no_std`.
+Implemented against the CoDeSys SoftMotion CNC feature model; not included (backlog):
+ellipses and NURBS words, 3D tool radius correction, preprocessing across the seam between
+two streamed pieces, fieldbus drivers (EtherCAT/CiA402), `no_std`.
 
-Known v1 behavior notes:
+Behavior notes:
 
 - Junction reachability uses the exact jerk-limited ramp distance, derated by a configurable
   margin on acceleration and jerk (`LookAhead::accel_margin`, default 0.8) as headroom for
   override changes. A retarget (override, single-step) that the current state cannot follow
   any more — typically in the last ramp before a junction — keeps the running profile and
   takes effect at the next span; profiles never reverse or stall along the path.
+- Carried acceleration (`LookAhead::carry_acceleration`, on by default) only ever adds to
+  the zero-acceleration plan, which is still planned and followed wherever no profile leads
+  straight to a carried state. Inside a carried braking ramp that plan can be out of reach;
+  should the ramp not be continuable there, the path brakes to a standstill and goes on
+  from rest by itself. Switch it off to get a profile per span with zero acceleration at
+  every span boundary.
 - Junction deviation limits the *centripetal* effect of a corner, not the jump itself: at a
   corner taken at speed the axis velocities change direction within one cycle (tangential
-  velocity, acceleration and jerk stay continuous and limited). Lower
-  `LookAhead::junction_deviation`, or insert `CornerRounding`, where the drives need less.
+  velocity, acceleration and jerk stay continuous and limited). Set
+  `AxisConfig::with_velocity_jump` to bound the step per axis, lower
+  `LookAhead::junction_deviation`, or insert `CornerRounding` / `CornerSmoothing`, where the
+  drives need less.
+- `CornerSmoothing` makes the path curvature-continuous, but a blend is confined to the two
+  moves it joins: on a contour of very short moves the blends are tight, and the smoothed
+  path can run slower than the unsmoothed one under the junction-deviation rule (which
+  allows a velocity step at each corner).
 - An M event forces an exact stop at its program position (CoDeSys default for
-  synchronized M functions).
+  synchronized M functions) unless it is configured as fly-by.
 - A pause (override → 0) brakes time-optimally and may cross blended segment boundaries;
   it never crosses an exact-stop boundary.
+- Backward motion goes back as far as the program start, or as far as `discard_history`
+  has left; dwells, events and switch points are not executed on the way back.
+- Tool radius correction removes contour details locally (see the module docs for the
+  limits): a bottleneck between two distant parts of a contour is not detected.
 
 ## License
 

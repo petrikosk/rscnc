@@ -1,11 +1,13 @@
-//! Decoder (the `SMC_NCDecoder` analogue): parsed blocks + modal state →
+//! Decoder (the `SMC_NCDecoder` analogue): program text + modal state →
 //! geometry queue.
 //!
-//! Supported words (v1): `N G0 G1 G2 G3 G4 G17 G18 G19 G40 G41 G42
-//! G70/G71 (G20/G21 aliases) G90 G91 G92, X Y Z I J K R F E S T M H L O, P`
-//! (dwell time for G4, seconds) plus the configured auxiliary axis letters and
-//! their `F<axis>`/`E<axis>` limits. `M2`/`M30` end the program. All other M
-//! codes become synchronized [`SyncEvent`]s; unknown G codes are errors.
+//! Supported words: `N G0 G1 G2 G3 G4 G5 G17 G18 G19 G25 G26 G40 G41 G42 G43
+//! G49 G53 G54…G59 G70/G71 (G20/G21 aliases) G90 G91 G92, X Y Z I J K R F E S
+//! T M H L O, P` (dwell time for G4, seconds; subprogram number for M98) plus
+//! the configured auxiliary axis letters and their `F<axis>`/`E<axis>`
+//! limits. `M2`/`M30` end the program, `M98`/`M99` call and leave a
+//! subprogram. All other M codes become synchronized [`SyncEvent`]s; unknown
+//! G codes are errors.
 //!
 //! Dynamics follow CODESYS SoftMotion's DIN 66025 reading: `F` is the path
 //! velocity in units/**second**, `E` is the maximum path acceleration when
@@ -21,16 +23,123 @@
 //! Internal units are mm and seconds: axis words, `F` and `E` are scaled by
 //! the active unit mode. Auxiliary axis words are *not* unit-scaled (they are
 //! typically rotary degrees), and neither are `F<axis>`/`E<axis>`.
+//!
+//! # Coordinate systems
+//!
+//! The queue's geometry is in machine coordinates. A programmed coordinate
+//! becomes a machine coordinate as
+//!
+//! ```text
+//! machine = programmed + work offset − G92 shift (+ tool length, Z only)
+//! ```
+//!
+//! * `G54`…`G59` (modal, `G54` at start) select the work offset from
+//!   [`DecoderConfig::work_offsets`]. All zeros by default, so a program that
+//!   never leaves `G54` is programmed in machine coordinates.
+//! * `G92 X.. Y.. Z..` gives the current point the programmed coordinates
+//!   written in the block. Its shift lies on top of the work offset and stays
+//!   in force when another work offset is selected.
+//! * `G53` (one block only) reads the block's `X Y Z` and auxiliary axis
+//!   words as absolute machine coordinates: no work offset, no `G92` shift,
+//!   no tool length, also under `G91`.
+//! * `G43` switches tool length compensation on, `G49` off. `G43` latches the
+//!   length of the active tool — the `T` word of the same block if it has
+//!   one, else the last `T` programmed — from [`DecoderConfig::tool_lengths`];
+//!   a later `T` word does not change it until the next `G43`. The length is
+//!   added to programmed absolute Z coordinates, so neither code moves the
+//!   axis by itself: the change takes effect with the next block that
+//!   programs Z.
+//!
+//! # Working area
+//!
+//! `G25 X.. Y.. Z..` sets the lower corner of the working area and
+//! `G26 X.. Y.. Z..` the upper one, for the axes written (programmed
+//! coordinates of the active system, or machine coordinates with `G53`); the
+//! block does not move. Every path element decoded afterwards must lie
+//! inside the area — an arc's bulge and a spline's sweep included — or its
+//! block is refused with an error. [`DecoderConfig::work_area_min`] and
+//! [`DecoderConfig::work_area_max`] give the area at program start.
+//!
+//! # Splines
+//!
+//! `G5` (modal) makes the programmed points the points of a spline: the
+//! curve starts at the current position and passes through every point of the
+//! `G5` blocks that follow, with a continuous tangent. The run ends with the
+//! first block that selects another motion mode, or carries `G4`, `G92`,
+//! `G25`/`G26` or an event (`M`, `S`, `T`; the block's own point still
+//! belongs to the run), and at the end of the program text. Each span between
+//! two points becomes one [`Geometry::Spline`] element with the feed, limits,
+//! auxiliary axis targets and switch points of the block that programmed its
+//! end point.
+//!
+//! The curve is a Catmull-Rom spline with chord-length parameterization:
+//! the tangent at an inner point is the average of the two chord directions
+//! there, the shorter chord counting more (for evenly spaced points this is
+//! the classic (pᵢ₊₁ − pᵢ₋₁)/2). The two ends are *natural*: the curve
+//! starts and ends with zero curvature. A run of a single point is a
+//! straight line; a point repeated in place is skipped. Points that turn
+//! straight back on the way they came (`X10`, then `X0`) are refused, since
+//! no smooth curve does that without standing still.
+//!
+//! # Variables and program flow
+//!
+//! In the style of Fanuc Macro B:
+//!
+//! | Form                              | Meaning                               |
+//! |-----------------------------------|---------------------------------------|
+//! | `#1 = <expr>`                     | assignment (several fit in a line)    |
+//! | `X#1`, `X-#1`, `X[#1 + 2]`        | a word whose value is computed        |
+//! | `GOTO n`                          | jump to the block numbered `N n`      |
+//! | `IF [<expr>] GOTO n`              | conditional jump                      |
+//! | `IF [<expr>] THEN #1 = <expr>`    | conditional assignment                |
+//! | `WHILE [<expr>] DO m` … `END m`   | loop (nestable)                       |
+//! | `M98 P<n> K<count>`               | call the subprogram at block `N<n>`, `count` times (once without `K`) |
+//! | `M99`                             | return from the subprogram            |
+//!
+//! Expressions know `+ - * /` and `MOD`, the comparisons `EQ NE GT GE LT LE`
+//! (1 when true, 0 when false), the logical `AND OR XOR` (anything non-zero
+//! is true) and the functions `SIN COS TAN ASIN ACOS ATAN SQRT ABS ROUND FIX
+//! FUP`, angles in degrees; `ATAN[y]/[x]` is the two-argument arc tangent.
+//! Brackets group, since parentheses are comments. Precedence, tightest
+//! first: unary sign, `* / MOD`, `+ -`, comparisons, `AND OR XOR`.
+//! `#[<expr>]` addresses a variable by a computed number.
+//!
+//! Variables live in the [`Decoder`] and keep their values from one
+//! [`decode_chunk`](Decoder::decode_chunk) to the next. Reading a variable
+//! that was never assigned is an error, as are a division by zero and a
+//! jump to a block number that does not exist (the first block with the
+//! number counts when several have it). A subprogram is part of the same
+//! program text — put it after the `M2`/`M30` of the main program — and
+//! `M98`/`M99` stand alone in their blocks. Calls nest
+//! [`MAX_CALL_DEPTH`] deep. A program that keeps jumping is stopped with an
+//! error after [`DecoderConfig::max_executed_blocks`].
+//!
+//! [`Decoder::decode_block`] sees none of this: it takes one plain, already
+//! lexed block. The statements above are handled by
+//! [`Decoder::decode_chunk`] and [`Decoder::decode_source`].
 
 use crate::error::{CncError, DecodeError};
-use crate::gcode::lexer::{lex, ParsedBlock};
+use crate::gcode::lexer::ParsedBlock;
+use crate::gcode::macros::{self, Assign, Expr, Line, Stmt, Then, Variables};
 use crate::gcode::program::{DistanceMode, ModalState, MotionMode, TrcMode, Units};
-use crate::geometry::{ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, SwitchPoint, SyncEvent};
+use crate::geometry::{
+    dot, norm, sub, ArcSeg, GeoElem, GeoMove, Geometry, LineSeg, Segment, SplineSeg, SwitchPoint,
+    SyncEvent,
+};
 use crate::queue::GeoQueue;
-use crate::types::WorkPlane;
+use crate::types::{PathPoint, WorkPlane};
+use std::collections::HashMap;
 
-/// Decoder configuration: machine start pose, auxiliary axis letters and
-/// tolerances.
+/// How deep subprogram calls (`M98`) may nest.
+pub const MAX_CALL_DEPTH: usize = 16;
+
+/// Slack of the working-area check, internal units.
+const AREA_TOLERANCE: f64 = 1e-9;
+
+const AXIS_NAMES: [char; 3] = ['X', 'Y', 'Z'];
+
+/// Decoder configuration: machine start pose, auxiliary axis letters,
+/// coordinate systems, tool table, working area and tolerances.
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
     /// Letters of the auxiliary (non-path) axes, in machine order.
@@ -45,6 +154,34 @@ pub struct DecoderConfig {
     pub start_position: [f64; 3],
     /// Machine position of the auxiliary axes at program start.
     pub start_aux: Vec<f64>,
+    /// M functions the path does not stop for (*fly-by* M functions). A
+    /// block's event is a fly-by event when all its M codes are listed here
+    /// and it carries no tool change (`T`); the interpolator then reports it
+    /// while the path runs through the junction. All other events force an
+    /// exact stop, as before.
+    pub fly_by_m: Vec<u32>,
+    /// Work coordinate systems `G54`…`G59`: the machine coordinates of each
+    /// system's zero point, internal units. All zeros by default.
+    pub work_offsets: [[f64; 3]; 6],
+    /// Tool table for `G43`: (tool number, tool length in internal units).
+    /// `G43` with a tool that has no entry is an error. Empty by default.
+    pub tool_lengths: Vec<(u32, f64)>,
+    /// Lower corner of the working area at program start, machine
+    /// coordinates; `-∞` leaves an axis unlimited (the default). `G25`
+    /// changes it from the program.
+    pub work_area_min: [f64; 3],
+    /// Upper corner of the working area at program start, machine
+    /// coordinates; `+∞` leaves an axis unlimited (the default). `G26`
+    /// changes it from the program.
+    pub work_area_max: [f64; 3],
+    /// Initial values of variables: (variable number, value). Empty by
+    /// default.
+    pub variables: Vec<(u32, f64)>,
+    /// Guard against programs that never end: decoding one program text
+    /// stops with an error once it has executed this many blocks more than
+    /// the text has lines (a text without jumps and loops never does).
+    /// 1 000 000 by default.
+    pub max_executed_blocks: usize,
 }
 
 impl Default for DecoderConfig {
@@ -56,13 +193,22 @@ impl Default for DecoderConfig {
             min_segment_length: 1e-9,
             start_position: [0.0; 3],
             start_aux: vec![],
+            fly_by_m: vec![],
+            work_offsets: [[0.0; 3]; 6],
+            tool_lengths: vec![],
+            work_area_min: [f64::NEG_INFINITY; 3],
+            work_area_max: [f64::INFINITY; 3],
+            variables: vec![],
+            max_executed_blocks: 1_000_000,
         }
     }
 }
 
-/// The DIN 66025 decoder: turns parsed blocks into geometry queue elements
+/// The DIN 66025 decoder: turns program text into geometry queue elements
 /// while tracking modal state. Use [`Decoder::decode_source`] for the
-/// common whole-program case.
+/// common whole-program case and [`Decoder::decode_chunk`] to feed a program
+/// piece by piece.
+#[derive(Debug, Clone)]
 pub struct Decoder {
     cfg: DecoderConfig,
     state: ModalState,
@@ -71,6 +217,12 @@ pub struct Decoder {
     /// Switch points programmed in blocks that produced no path element of
     /// their own; they ride on the next element that is created.
     pending_switches: Vec<PendingSwitch>,
+    variables: Variables,
+    /// Working area (machine coordinates).
+    area_min: [f64; 3],
+    area_max: [f64; 3],
+    /// `G5` points waiting for the end of their run.
+    spline: Option<SplineRun>,
 }
 
 /// Where an `L`/`O` word puts a switch point, in programmed units.
@@ -90,6 +242,86 @@ struct PendingSwitch {
     src_line: usize,
 }
 
+/// A run of `G5` points that is still open.
+#[derive(Debug, Clone)]
+struct SplineRun {
+    /// Where the curve starts (machine coordinates).
+    start: PathPoint,
+    aux_start: Vec<f64>,
+    points: Vec<SplinePoint>,
+}
+
+/// One `G5` point with everything its span takes from its block.
+#[derive(Debug, Clone)]
+struct SplinePoint {
+    target: PathPoint,
+    aux_end: Vec<f64>,
+    feed: f64,
+    accel: Option<f64>,
+    decel: Option<f64>,
+    trc: TrcMode,
+    line: usize,
+    /// Unit scale of the block (for `L` words).
+    scale: f64,
+    switches: Vec<PendingSwitch>,
+    aux_feed: Vec<Option<f64>>,
+    aux_accel: Vec<Option<f64>>,
+    aux_decel: Vec<Option<f64>>,
+}
+
+/// A subprogram call in progress.
+#[derive(Debug, Clone, Copy)]
+struct Call {
+    /// Line index to continue at after the last return.
+    ret: usize,
+    /// Line index of the subprogram's first block.
+    target: usize,
+    /// Runs left, this one included.
+    remaining: u32,
+    /// Source line of the `M98`.
+    src_line: usize,
+}
+
+/// What a program text's jumps need while it runs.
+#[derive(Debug, Default)]
+struct Flow {
+    /// Block number → line index, built when the first jump needs it.
+    labels: Option<HashMap<u32, usize>>,
+    calls: Vec<Call>,
+}
+
+impl Flow {
+    /// Line index of the first block numbered `number`.
+    fn label(&mut self, number: u32, lines: &[Line]) -> Option<usize> {
+        self.labels
+            .get_or_insert_with(|| {
+                let mut map = HashMap::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if let Some(n) = line.number {
+                        map.entry(n).or_insert(i);
+                    }
+                }
+                map
+            })
+            .get(&number)
+            .copied()
+    }
+}
+
+/// Which corner of the working area a block sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Corner {
+    /// `G25`
+    Lower,
+    /// `G26`
+    Upper,
+}
+
+/// `value` as a whole number in `0..=u32::MAX`.
+fn whole(value: f64) -> Option<u32> {
+    (value >= 0.0 && value.fract() == 0.0 && value <= f64::from(u32::MAX)).then_some(value as u32)
+}
+
 impl Decoder {
     /// New decoder starting from the configured machine pose with default
     /// modal state.
@@ -102,11 +334,15 @@ impl Decoder {
             }
         }
         Self {
+            variables: cfg.variables.iter().copied().collect(),
+            area_min: cfg.work_area_min,
+            area_max: cfg.work_area_max,
             cfg,
             state,
             obj_no: 0,
             ended: false,
             pending_switches: Vec::new(),
+            spline: None,
         }
     }
 
@@ -116,8 +352,11 @@ impl Decoder {
     /// A lexical problem comes back as [`CncError::Gcode`] and a semantic one
     /// as [`CncError::Decode`], each carrying the 1-based source line, so a
     /// caller can tell "bad token on line N" from "bad block on line N"
-    /// without driving [`lex`] and [`decode_block`](Self::decode_block) by
+    /// without driving the lexer and [`decode_block`](Self::decode_block) by
     /// hand.
+    ///
+    /// The same as [`Decoder::new`], one [`decode_chunk`](Self::decode_chunk)
+    /// and [`finish`](Self::finish).
     ///
     /// ```
     /// use rscnc::prelude::*;
@@ -127,26 +366,74 @@ impl Decoder {
     /// assert!(matches!(err, CncError::Gcode(ref e) if e.line == 2));
     /// ```
     pub fn decode_source(cfg: DecoderConfig, source: &str) -> Result<GeoQueue, CncError> {
-        let blocks = lex(source)?;
         let mut decoder = Decoder::new(cfg);
-        let mut queue = GeoQueue::new();
-        for block in &blocks {
-            decoder.decode_block(block, &mut queue)?;
-            if decoder.ended {
-                break;
+        let queue = decoder.decode_chunk(source)?;
+        decoder.finish()?;
+        Ok(queue)
+    }
+
+    /// Decode one piece of program text, keeping everything modal — motion
+    /// mode, feed, position, offsets, working area, variables — for the
+    /// piece that follows. This is how a program is fed in parts (streaming,
+    /// MDI): every call returns the path elements of its own text.
+    ///
+    /// What does not reach across the seam between two pieces:
+    ///
+    /// * jump targets: `GOTO`, `M98` and `WHILE`/`END` pairs are resolved
+    ///   inside one piece of text, and a subprogram has to return in it;
+    /// * a `G5` spline: the run is closed at the end of the text (`G5` itself
+    ///   stays modal, so the next piece starts a new curve).
+    ///
+    /// A switch point (`H`) programmed after the last move of the text is
+    /// kept and rides on the first element of the next piece;
+    /// [`finish`](Self::finish) reports one that is left over at the very end.
+    ///
+    /// After `M2`/`M30` further text is ignored (an empty queue is returned)
+    /// until [`resume`](Self::resume).
+    ///
+    /// The call is all or nothing: on an error the decoder is exactly as it
+    /// was before the call, so a corrected text can be decoded in its place.
+    /// Line numbers in errors count from the start of `source`.
+    ///
+    /// ```
+    /// use rscnc::prelude::*;
+    ///
+    /// let mut decoder = Decoder::new(DecoderConfig::default());
+    /// let first = decoder.decode_chunk("#1 = 10\nG1 F50 X#1\n")?;
+    /// let second = decoder.decode_chunk("Y[#1 / 2]\n")?; // still G1 F50, #1 known
+    /// decoder.finish()?;
+    /// assert_eq!((first.len(), second.len()), (1, 1));
+    /// # Ok::<(), CncError>(())
+    /// ```
+    pub fn decode_chunk(&mut self, source: &str) -> Result<GeoQueue, CncError> {
+        if self.ended {
+            return Ok(GeoQueue::new());
+        }
+        let mut lines = macros::parse_program(source)?;
+        let backup = self.clone();
+        match self.run(&mut lines) {
+            Ok(queue) => Ok(queue),
+            Err(e) => {
+                *self = backup;
+                Err(e.into())
             }
         }
-        if let Some(p) = decoder.pending_switches.first() {
-            return Err(DecodeError::new(
+    }
+
+    /// End-of-program check: a switch point (`H`) still waiting for a path
+    /// element to ride on is an error. Users of
+    /// [`decode_block`](Self::decode_block) call [`flush`](Self::flush) first.
+    pub fn finish(&self) -> Result<(), DecodeError> {
+        match self.pending_switches.first() {
+            Some(p) => Err(DecodeError::new(
                 p.src_line,
                 format!(
                     "switch point H{} has no path element to ride on (no move follows it)",
                     p.number
                 ),
-            )
-            .into());
+            )),
+            None => Ok(()),
         }
-        Ok(queue)
     }
 
     /// Convenience: lex + decode a whole program, reporting every failure as
@@ -176,7 +463,213 @@ impl Decoder {
         self.ended
     }
 
-    /// Decode one block, appending 0..k elements to `out`.
+    /// Clear the program-end flag set by `M2`/`M30`, so that further text is
+    /// decoded again. The modal state and the variables are kept.
+    pub fn resume(&mut self) {
+        self.ended = false;
+    }
+
+    /// Value of variable `#number`, or `None` if it was never assigned.
+    pub fn variable(&self, number: u32) -> Option<f64> {
+        self.variables.get(&number).copied()
+    }
+
+    /// Assign variable `#number` from outside the program.
+    pub fn set_variable(&mut self, number: u32, value: f64) {
+        self.variables.insert(number, value);
+    }
+
+    /// The working area in force: (lower corner, upper corner) in machine
+    /// coordinates, `±∞` where an axis is unlimited.
+    pub fn work_area(&self) -> ([f64; 3], [f64; 3]) {
+        (self.area_min, self.area_max)
+    }
+
+    /// Run the lines of one program text.
+    fn run(&mut self, lines: &mut [Line]) -> Result<GeoQueue, DecodeError> {
+        macros::link_loops(lines).map_err(|(line, msg)| DecodeError::new(line, msg))?;
+        let lines = &*lines;
+        let mut out = GeoQueue::new();
+        let mut flow = Flow::default();
+        let budget = lines.len().saturating_add(self.cfg.max_executed_blocks);
+        let mut executed = 0usize;
+        let mut pc = 0;
+        while let Some(line) = lines.get(pc) {
+            if self.ended {
+                break;
+            }
+            let at = line.src_line;
+            let fail = |msg: String| DecodeError::new(at, msg);
+            executed += 1;
+            if executed > budget {
+                return Err(fail(format!(
+                    "the program does not end: it ran {} blocks more than its {} lines \
+                     (an endless loop? see DecoderConfig::max_executed_blocks)",
+                    self.cfg.max_executed_blocks,
+                    lines.len()
+                )));
+            }
+            let mut next = pc + 1;
+            match &line.stmt {
+                Stmt::Plain(block) => {
+                    if let Some(to) = self.block(block, pc, lines, &mut flow, &mut out)? {
+                        next = to;
+                    }
+                }
+                Stmt::Block(words) => {
+                    let block = macros::evaluate_block(words, line.number, at, &self.variables)
+                        .map_err(fail)?;
+                    if let Some(to) = self.block(&block, pc, lines, &mut flow, &mut out)? {
+                        next = to;
+                    }
+                }
+                Stmt::Assign(list) => self.assign(list).map_err(fail)?,
+                Stmt::Goto(target) => {
+                    next = self.jump_target(target, lines, &mut flow).map_err(fail)?;
+                }
+                Stmt::If { cond, then } => {
+                    if cond.eval(&self.variables).map_err(fail)? != 0.0 {
+                        match then {
+                            Then::Goto(target) => {
+                                next = self.jump_target(target, lines, &mut flow).map_err(fail)?;
+                            }
+                            Then::Assign(list) => self.assign(list).map_err(fail)?,
+                        }
+                    }
+                }
+                Stmt::While { cond, end, .. } => {
+                    if cond.eval(&self.variables).map_err(fail)? == 0.0 {
+                        next = end + 1;
+                    }
+                }
+                Stmt::End { start, .. } => next = *start,
+            }
+            pc = next;
+        }
+        if !self.ended {
+            if let Some(call) = flow.calls.last() {
+                return Err(DecodeError::new(
+                    call.src_line,
+                    "the subprogram called here does not return (no M99 before the end of \
+                     the program text)",
+                ));
+            }
+        }
+        self.flush(&mut out)?;
+        Ok(out)
+    }
+
+    fn assign(&mut self, list: &[Assign]) -> Result<(), String> {
+        for a in list {
+            let number = macros::variable_number(a.target.eval(&self.variables)?)?;
+            let value = a.value.eval(&self.variables)?;
+            self.variables.insert(number, value);
+        }
+        Ok(())
+    }
+
+    /// Line index of the block a jump goes to.
+    fn jump_target(&self, target: &Expr, lines: &[Line], flow: &mut Flow) -> Result<usize, String> {
+        let value = target.eval(&self.variables)?;
+        let number =
+            whole(value).ok_or_else(|| format!("{value} is not a block number to jump to"))?;
+        flow.label(number, lines)
+            .ok_or_else(|| format!("jump to N{number}, but no block has that number"))
+    }
+
+    /// Execute one plain block: a subprogram call or return, or a block for
+    /// [`decode_block`](Self::decode_block). Returns the line to continue at
+    /// when that is not the next one.
+    fn block(
+        &mut self,
+        block: &ParsedBlock,
+        pc: usize,
+        lines: &[Line],
+        flow: &mut Flow,
+        out: &mut GeoQueue,
+    ) -> Result<Option<usize>, DecodeError> {
+        let has_m = |code: f64| {
+            block
+                .words
+                .iter()
+                .any(|w| w.letter == 'M' && w.suffix.is_none() && w.value == code)
+        };
+        let err = |msg: String| DecodeError::new(block.src_line, msg);
+        if has_m(98.0) {
+            let (mut target, mut count) = (None, 1);
+            for w in &block.words {
+                match (w.letter, w.suffix) {
+                    ('M', None) if w.value == 98.0 => {}
+                    ('P', None) => {
+                        target = Some(whole(w.value).ok_or_else(|| {
+                            err(format!("M98: P{} is not a block number", w.value))
+                        })?);
+                    }
+                    ('K', None) => {
+                        count = whole(w.value).ok_or_else(|| {
+                            err(format!("M98: K{} is not a repeat count", w.value))
+                        })?;
+                    }
+                    _ => {
+                        return Err(err(format!(
+                            "M98 stands alone with its P (and K) word, found '{}'",
+                            w.name()
+                        )))
+                    }
+                }
+            }
+            let number =
+                target.ok_or_else(|| err("M98 requires a P word (the block number)".into()))?;
+            let target = flow
+                .label(number, lines)
+                .ok_or_else(|| err(format!("M98 P{number}: no block is numbered N{number}")))?;
+            if count == 0 {
+                return Ok(None);
+            }
+            if flow.calls.len() >= MAX_CALL_DEPTH {
+                return Err(err(format!(
+                    "subprogram calls nested deeper than {MAX_CALL_DEPTH}"
+                )));
+            }
+            flow.calls.push(Call {
+                ret: pc + 1,
+                target,
+                remaining: count,
+                src_line: block.src_line,
+            });
+            Ok(Some(target))
+        } else if has_m(99.0) {
+            if block.words.len() != 1 {
+                return Err(err("M99 stands alone in its block".into()));
+            }
+            match flow.calls.last_mut() {
+                Some(call) if call.remaining > 1 => {
+                    call.remaining -= 1;
+                    Ok(Some(call.target))
+                }
+                Some(call) => {
+                    let ret = call.ret;
+                    flow.calls.pop();
+                    Ok(Some(ret))
+                }
+                None => Err(err(
+                    "M99 outside a subprogram call (end the main program with M2/M30 before \
+                     its subprograms)"
+                        .into(),
+                )),
+            }
+        } else {
+            self.decode_block(block, out)?;
+            Ok(None)
+        }
+    }
+
+    /// Decode one plain block, appending 0..k elements to `out`.
+    ///
+    /// This is the layer below [`decode_chunk`](Self::decode_chunk): no
+    /// variables, no jumps, and `M98`/`M99` are ordinary M functions here.
+    /// `G5` points are held back until their run ends, so call
+    /// [`flush`](Self::flush) after the last block.
     pub fn decode_block(
         &mut self,
         block: &ParsedBlock,
@@ -333,6 +826,12 @@ impl Decoder {
         // Apply non-motion modal G codes first (units before axis-word scaling)
         let mut dwell = false;
         let mut set_position = false;
+        // G53: this block's coordinates are machine coordinates
+        let mut machine = false;
+        // G25 / G26: the block sets a corner of the working area
+        let mut area: Option<Corner> = None;
+        // G43: latch the active tool's length
+        let mut length_comp = false;
         for &g in &g_codes {
             match g {
                 0 => self.state.motion = MotionMode::Rapid,
@@ -340,12 +839,30 @@ impl Decoder {
                 2 => self.state.motion = MotionMode::ArcCw,
                 3 => self.state.motion = MotionMode::ArcCcw,
                 4 => dwell = true,
+                5 => self.state.motion = MotionMode::Spline,
                 17 => self.state.plane = WorkPlane::Xy,
                 18 => self.state.plane = WorkPlane::Zx,
                 19 => self.state.plane = WorkPlane::Yz,
+                25 | 26 => {
+                    if area.is_some() {
+                        return Err(err("G25 and G26 need a block each".into()));
+                    }
+                    area = Some(if g == 25 {
+                        Corner::Lower
+                    } else {
+                        Corner::Upper
+                    });
+                }
                 40 => self.state.trc = TrcMode::Off,
                 41 => self.state.trc = TrcMode::Left,
                 42 => self.state.trc = TrcMode::Right,
+                43 => length_comp = true,
+                49 => {
+                    length_comp = false;
+                    self.state.tool_length = 0.0;
+                }
+                53 => machine = true,
+                54..=59 => self.state.work_offset = (g - 54) as usize,
                 70 | 20 => self.state.units = Units::Inch,
                 71 | 21 => self.state.units = Units::Mm,
                 90 => self.state.distance = DistanceMode::Absolute,
@@ -353,6 +870,9 @@ impl Decoder {
                 92 => set_position = true,
                 other => return Err(err(format!("unsupported G code G{other}"))),
             }
+        }
+        if area.is_some() && (dwell || set_position) {
+            return Err(err("G25/G26 cannot share a block with G4 or G92".into()));
         }
 
         let scale = self.state.units.to_mm();
@@ -387,6 +907,31 @@ impl Decoder {
             }
         }
 
+        let tool = match t_word {
+            Some(t) => Some(whole(t).ok_or_else(|| err(format!("invalid tool number T{t}")))?),
+            None => None,
+        };
+        if length_comp {
+            // The block's own T word names the tool whose length is meant.
+            let active = tool.unwrap_or(self.state.tool);
+            let Some(&(_, length)) = self.cfg.tool_lengths.iter().find(|(n, _)| *n == active)
+            else {
+                return Err(err(format!(
+                    "G43: tool T{active} has no entry in the tool length table \
+                     (DecoderConfig::tool_lengths)"
+                )));
+            };
+            self.state.tool_length = length;
+        }
+
+        let has_axis = axis.iter().any(Option::is_some) || aux.iter().any(Option::is_some);
+        let arc_data = r_word.is_some() || ijk.iter().any(Option::is_some);
+        // A spline run goes on only through blocks that stay in G5 and do
+        // nothing but add a point or set something modal.
+        if self.state.motion != MotionMode::Spline || dwell || set_position || area.is_some() {
+            self.flush(out)?;
+        }
+
         if dwell {
             let seconds = p_word.ok_or_else(|| err("G4 requires a P word (seconds)".into()))?;
             if seconds < 0.0 || !seconds.is_finite() {
@@ -396,11 +941,35 @@ impl Decoder {
                 seconds,
                 src_line: line,
             });
+        } else if let Some(corner) = area {
+            if aux.iter().any(Option::is_some) {
+                return Err(err(
+                    "G25/G26 limit the path axes X Y Z only (auxiliary axis word found)".into(),
+                ));
+            }
+            if axis.iter().all(Option::is_none) {
+                return Err(err("G25/G26 require at least one of X Y Z".into()));
+            }
+            // Always absolute: a limit is a place, not a distance.
+            for (i, v) in axis.iter().enumerate() {
+                let Some(v) = v else { continue };
+                let limit = if machine {
+                    v * scale
+                } else {
+                    self.to_machine(i, v * scale)
+                };
+                match corner {
+                    Corner::Lower => self.area_min[i] = limit,
+                    Corner::Upper => self.area_max[i] = limit,
+                }
+            }
         } else if set_position {
-            // G92: the current point gets the given programmed coordinates.
+            // G92: the current point gets the given programmed coordinates,
+            // i.e. `to_machine` of them is the current position from here on.
             for (i, v) in axis.iter().enumerate() {
                 if let Some(v) = v {
-                    self.state.g92_offset[i] = v * scale - self.state.position[i];
+                    self.state.g92_offset[i] =
+                        v * scale + self.system_offset(i) - self.state.position[i];
                 }
             }
             for (i, v) in aux.iter().enumerate() {
@@ -408,22 +977,34 @@ impl Decoder {
                     self.state.aux_g92_offset[i] = v - self.state.aux_position[i];
                 }
             }
-        } else if axis.iter().any(Option::is_some) || aux.iter().any(Option::is_some) {
+        } else if has_axis {
             self.pending_switches.append(&mut switches);
-            self.decode_motion(line, &axis, &aux, &ijk, r_word, out)?;
-        } else if matches!(self.state.motion, MotionMode::ArcCw | MotionMode::ArcCcw)
-            && (r_word.is_some() || ijk.iter().any(Option::is_some))
-        {
+            if self.state.motion == MotionMode::Spline {
+                if arc_data {
+                    return Err(err("a G5 spline point takes no I/J/K or R word".into()));
+                }
+                self.spline_point(line, &axis, &aux, machine, out)?;
+            } else {
+                self.decode_motion(line, &axis, &aux, &ijk, r_word, machine, out)?;
+            }
+        } else if matches!(self.state.motion, MotionMode::ArcCw | MotionMode::ArcCcw) && arc_data {
             // Arc data without axis words: the end point is the start point,
             // i.e. a full circle (`G2 I-5`), also on a modal follow-up block.
             self.pending_switches.append(&mut switches);
-            self.decode_motion(line, &axis, &aux, &ijk, r_word, out)?;
+            self.decode_motion(line, &axis, &aux, &ijk, r_word, machine, out)?;
         } else if g_codes.contains(&2) || g_codes.contains(&3) {
             return Err(err("arc move without axis words or I/J/K".into()));
         } else {
             // A block with no path element of its own: its switch points ride
             // on the next element, at its start.
             self.pending_switches.append(&mut switches);
+        }
+
+        let has_event = !m_codes.is_empty() || s_word.is_some() || tool.is_some();
+        if has_event {
+            // An event (or the program end) closes a spline run, after the
+            // block's own point.
+            self.flush(out)?;
         }
 
         // Program end
@@ -433,29 +1014,119 @@ impl Decoder {
         }
 
         // Synchronized events after the block's motion (CoDeSys default)
-        if !m_codes.is_empty() || s_word.is_some() || t_word.is_some() {
-            let tool = match t_word {
-                Some(t) if t >= 0.0 && t.fract() == 0.0 => Some(t as u32),
-                Some(t) => return Err(err(format!("invalid tool number T{t}"))),
-                None => None,
-            };
+        if !m_codes.is_empty() || s_word.is_some() || tool.is_some() {
             if let Some(s) = s_word {
                 self.state.spindle_speed = s;
             }
             if let Some(t) = tool {
                 self.state.tool = t;
             }
+            let fly_by = !m_codes.is_empty()
+                && tool.is_none()
+                && m_codes.iter().all(|m| self.cfg.fly_by_m.contains(m));
             out.push(GeoElem::Event(SyncEvent {
                 m: m_codes,
                 spindle: s_word,
                 tool,
                 src_line: line,
+                fly_by,
             }));
         }
 
         Ok(())
     }
 
+    /// What the active coordinate system adds to a programmed coordinate of
+    /// path axis `i`, the `G92` shift aside: the work offset, and on Z the
+    /// tool length.
+    fn system_offset(&self, i: usize) -> f64 {
+        let tool = if i == 2 { self.state.tool_length } else { 0.0 };
+        self.cfg.work_offsets[self.state.work_offset][i] + tool
+    }
+
+    /// Machine coordinate of the programmed (absolute, already unit-scaled)
+    /// coordinate `v` of path axis `i`.
+    fn to_machine(&self, i: usize, v: f64) -> f64 {
+        v - self.state.g92_offset[i] + self.system_offset(i)
+    }
+
+    /// End point of a block in machine coordinates: path axes and auxiliary
+    /// axes. `machine`: the block's words are machine coordinates (G53).
+    fn targets(
+        &self,
+        axis: &[Option<f64>; 3],
+        aux: &[Option<f64>],
+        machine: bool,
+    ) -> (PathPoint, Vec<f64>) {
+        let scale = self.state.units.to_mm();
+        let mut target = self.state.position;
+        for i in 0..3 {
+            if let Some(v) = axis[i] {
+                target[i] = if machine {
+                    v * scale
+                } else {
+                    match self.state.distance {
+                        DistanceMode::Absolute => self.to_machine(i, v * scale),
+                        DistanceMode::Incremental => target[i] + v * scale,
+                    }
+                };
+            }
+        }
+        let mut aux_end = self.state.aux_position.clone();
+        for (i, v) in aux.iter().enumerate() {
+            if let Some(v) = v {
+                aux_end[i] = if machine {
+                    *v
+                } else {
+                    match self.state.distance {
+                        DistanceMode::Absolute => v - self.state.aux_g92_offset[i],
+                        DistanceMode::Incremental => aux_end[i] + v,
+                    }
+                };
+            }
+        }
+        (target, aux_end)
+    }
+
+    /// A path element has to stay inside the working area.
+    fn check_area(&self, geo: &Geometry, line: usize) -> Result<(), DecodeError> {
+        let unlimited = self.area_min.iter().all(|v| *v == f64::NEG_INFINITY)
+            && self.area_max.iter().all(|v| *v == f64::INFINITY);
+        if unlimited || geo.length() < 1e-12 {
+            return Ok(());
+        }
+        let (lo, hi) = geo.bounding_box();
+        for i in 0..3 {
+            let name = AXIS_NAMES[i];
+            let (min, max) = (self.area_min[i], self.area_max[i]);
+            if min > max {
+                return Err(DecodeError::new(
+                    line,
+                    format!(
+                        "the working area is empty: the lower limit of {name} ({min:.6}, G25) \
+                         is above its upper limit ({max:.6}, G26)"
+                    ),
+                ));
+            }
+            let (value, limit, which) = if lo[i] < min - AREA_TOLERANCE {
+                (lo[i], min, "lower")
+            } else if hi[i] > max + AREA_TOLERANCE {
+                (hi[i], max, "upper")
+            } else {
+                continue;
+            };
+            return Err(DecodeError::new(
+                line,
+                format!(
+                    "the move leaves the working area: {name} reaches {value:.6}, beyond its \
+                     {which} limit {limit:.6} (machine coordinates)"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn decode_motion(
         &mut self,
         line: usize,
@@ -463,34 +1134,16 @@ impl Decoder {
         aux: &[Option<f64>],
         ijk: &[Option<f64>; 3],
         r_word: Option<f64>,
+        machine: bool,
         out: &mut GeoQueue,
     ) -> Result<(), DecodeError> {
         let err = |msg: String| DecodeError::new(line, msg);
         let scale = self.state.units.to_mm();
         let start = self.state.position;
-
-        // Target in machine coordinates
-        let mut target = start;
-        for i in 0..3 {
-            if let Some(v) = axis[i] {
-                target[i] = match self.state.distance {
-                    DistanceMode::Absolute => v * scale - self.state.g92_offset[i],
-                    DistanceMode::Incremental => start[i] + v * scale,
-                };
-            }
-        }
-        let mut aux_end = self.state.aux_position.clone();
-        for (i, v) in aux.iter().enumerate() {
-            if let Some(v) = v {
-                aux_end[i] = match self.state.distance {
-                    DistanceMode::Absolute => v - self.state.aux_g92_offset[i],
-                    DistanceMode::Incremental => aux_end[i] + v,
-                };
-            }
-        }
+        let (target, aux_end) = self.targets(axis, aux, machine);
 
         let is_rapid = self.state.motion == MotionMode::Rapid;
-        let (mut feed, mut accel, mut decel) = if is_rapid {
+        let (feed, accel, decel) = if is_rapid {
             (
                 self.state.rapid_feed.unwrap_or(self.cfg.rapid_feed),
                 self.state.rapid_accel,
@@ -506,7 +1159,11 @@ impl Decoder {
         }
 
         let geo = match self.state.motion {
-            MotionMode::Rapid | MotionMode::Linear => Geometry::Line(LineSeg::new(start, target)),
+            // (Of a spline run only a move of the auxiliary axes alone comes
+            // here: there is no curve through a point that stands still.)
+            MotionMode::Rapid | MotionMode::Linear | MotionMode::Spline => {
+                Geometry::Line(LineSeg::new(start, target))
+            }
             MotionMode::ArcCw | MotionMode::ArcCcw => {
                 let ccw = self.state.motion == MotionMode::ArcCcw;
                 let arc = if let Some(r) = r_word {
@@ -533,6 +1190,7 @@ impl Decoder {
                 Geometry::Arc(arc.map_err(err)?)
             }
         };
+        self.check_area(&geo, line)?;
 
         self.state.position = target;
         let aux_start = core::mem::replace(&mut self.state.aux_position, aux_end.clone());
@@ -557,78 +1215,237 @@ impl Decoder {
             return Ok(());
         }
 
-        // A programmed F<axis>/E<axis> limits the axis' own motion; the axis
-        // moves Δ over the parameter length L, so it folds into a path limit.
-        for (i, (a0, a1)) in mv.aux_start.iter().zip(mv.aux_end.iter()).enumerate() {
-            let delta = (a1 - a0).abs();
-            if delta <= 0.0 {
-                continue;
-            }
-            let ratio = length / delta;
-            if let Some(v) = self.state.aux_feed[i] {
-                feed = feed.min(v * ratio);
-            }
-            if let Some(a) = self.state.aux_accel[i] {
-                accel = Some(accel.map_or(a * ratio, |x: f64| x.min(a * ratio)));
-            }
-            if let Some(a) = self.state.aux_decel[i] {
-                decel = Some(decel.map_or(a * ratio, |x: f64| x.min(a * ratio)));
-            }
-        }
-        if feed <= 0.0 {
+        fold_aux_limits(
+            &mut mv,
+            length,
+            &self.state.aux_feed,
+            &self.state.aux_accel,
+            &self.state.aux_decel,
+        );
+        if mv.feed <= 0.0 {
             return Err(err(
                 "an auxiliary axis feed limit reduces this move's feed to zero".into(),
             ));
         }
-        mv.feed = feed;
-        mv.accel = accel;
-        mv.decel = decel;
-        mv.switch_points = self.take_switch_points(length, scale)?;
+        mv.switch_points = resolve_switch_points(self.pending_switches.drain(..), length, scale)?;
 
         self.obj_no += 1;
         out.push(GeoElem::Move(mv));
         Ok(())
     }
 
-    /// Resolve the switch points waiting for a path element against that
-    /// element's length, in programmed order.
-    fn take_switch_points(
+    /// Take a `G5` block's point into the open spline run.
+    fn spline_point(
         &mut self,
-        length: f64,
-        scale: f64,
-    ) -> Result<Vec<SwitchPoint>, DecodeError> {
-        if self.pending_switches.is_empty() {
-            return Ok(Vec::new());
+        line: usize,
+        axis: &[Option<f64>; 3],
+        aux: &[Option<f64>],
+        machine: bool,
+        out: &mut GeoQueue,
+    ) -> Result<(), DecodeError> {
+        if self.state.feed <= 0.0 {
+            return Err(DecodeError::new(
+                line,
+                "no feed rate set (F word required before G5)",
+            ));
         }
-        let mut points = Vec::with_capacity(self.pending_switches.len());
-        for p in self.pending_switches.drain(..) {
-            let position = match p.pos {
-                // No L/O word: the switch point sits at the element's start.
-                None => 0.0,
-                Some(SwitchPos::Relative(o)) => o * length,
-                // L is a distance from the start, or from the end when negative.
-                Some(SwitchPos::Absolute(l)) if l >= 0.0 => l * scale,
-                Some(SwitchPos::Absolute(l)) => length + l * scale,
-            };
-            if !(0.0..=length).contains(&position) {
+        let start = self.state.position;
+        let (target, aux_end) = self.targets(axis, aux, machine);
+        if norm(&sub(&target, &start)) < self.cfg.min_segment_length.max(1e-12) {
+            if aux_end == self.state.aux_position {
+                // The point repeats the previous one: skipped. Its switch
+                // points stay pending and ride on the next span.
+                return Ok(());
+            }
+            // The auxiliary axes move alone: a move of its own between two
+            // curves.
+            self.flush(out)?;
+            return self.decode_motion(line, axis, aux, &[None; 3], None, machine, out);
+        }
+        let aux_start = &self.state.aux_position;
+        let run = self.spline.get_or_insert_with(|| SplineRun {
+            start,
+            aux_start: aux_start.clone(),
+            points: Vec::new(),
+        });
+        run.points.push(SplinePoint {
+            target,
+            aux_end: aux_end.clone(),
+            feed: self.state.feed,
+            accel: self.state.accel,
+            decel: self.state.decel,
+            trc: self.state.trc,
+            line,
+            scale: self.state.units.to_mm(),
+            switches: core::mem::take(&mut self.pending_switches),
+            aux_feed: self.state.aux_feed.clone(),
+            aux_accel: self.state.aux_accel.clone(),
+            aux_decel: self.state.aux_decel.clone(),
+        });
+        self.state.position = target;
+        self.state.aux_position = aux_end;
+        Ok(())
+    }
+
+    /// Close the open `G5` spline run, if there is one, and append its
+    /// elements to `out`. [`decode_chunk`](Self::decode_chunk) and
+    /// [`decode_source`](Self::decode_source) do this themselves; it is for
+    /// users of [`decode_block`](Self::decode_block), after their last block.
+    pub fn flush(&mut self, out: &mut GeoQueue) -> Result<(), DecodeError> {
+        let Some(run) = self.spline.take() else {
+            return Ok(());
+        };
+        let n = run.points.len();
+        let mut pts: Vec<PathPoint> = Vec::with_capacity(n + 1);
+        pts.push(run.start);
+        pts.extend(run.points.iter().map(|p| p.target));
+        let chord: Vec<PathPoint> = pts.windows(2).map(|w| sub(&w[1], &w[0])).collect();
+        let len: Vec<f64> = chord.iter().map(norm).collect();
+        // A smooth curve cannot turn straight back at a point: it would have
+        // to stand still there.
+        for k in 1..n {
+            if dot(&chord[k - 1], &chord[k]) <= -(1.0 - 1e-12) * len[k - 1] * len[k] {
                 return Err(DecodeError::new(
-                    p.src_line,
-                    format!(
-                        "switch point H{} falls outside its {length:.6} long path element \
-                         (resolved to {position:.6})",
-                        p.number
-                    ),
+                    run.points[k - 1].line,
+                    "G5 spline: the path turns straight back at this point; end the spline \
+                     there (with a G1 block, for one)",
                 ));
             }
-            points.push(SwitchPoint {
-                number: p.number,
-                position,
-                src_line: p.src_line,
-            });
         }
-        points.sort_by(|a, b| a.position.total_cmp(&b.position));
-        Ok(points)
+        // Derivative per unit of chord length at the inner point `k`: the
+        // two chord directions there, the shorter chord counting more.
+        let slope = |k: usize| -> PathPoint {
+            let (la, lb) = (len[k - 1], len[k]);
+            core::array::from_fn(|i| {
+                (chord[k - 1][i] / la * lb + chord[k][i] / lb * la) / (la + lb)
+            })
+        };
+        // The end condition without curvature: the derivative at one end of a
+        // span with the chord `c` that makes p'' vanish there, given the
+        // derivative `other` at the span's other end.
+        let natural = |c: &PathPoint, other: &PathPoint| -> PathPoint {
+            core::array::from_fn(|i| (3.0 * c[i] - other[i]) / 2.0)
+        };
+
+        let mut aux_start = run.aux_start;
+        for (k, pt) in run.points.into_iter().enumerate() {
+            let line = pt.line;
+            let fail = move |msg: String| DecodeError::new(line, msg);
+            let geo = if n == 1 {
+                Geometry::Line(LineSeg::new(pts[0], pts[1]))
+            } else {
+                // Span k runs from pts[k] to pts[k + 1]
+                let l = len[k];
+                let (m0, m1) = if k == 0 {
+                    let m1 = slope(1).map(|x| x * l);
+                    (natural(&chord[k], &m1), m1)
+                } else if k + 1 == n {
+                    let m0 = slope(k).map(|x| x * l);
+                    (m0, natural(&chord[k], &m0))
+                } else {
+                    (slope(k).map(|x| x * l), slope(k + 1).map(|x| x * l))
+                };
+                let seg = SplineSeg::hermite(pts[k], m0, pts[k + 1], m1)
+                    .map_err(|e| fail(format!("G5 spline to this point: {e}")))?;
+                Geometry::Spline(Box::new(seg))
+            };
+            self.check_area(&geo, line)?;
+            let mut mv = GeoMove {
+                geo,
+                feed: pt.feed,
+                is_rapid: false,
+                aux_start: core::mem::replace(&mut aux_start, pt.aux_end.clone()),
+                aux_end: pt.aux_end,
+                trc: pt.trc,
+                accel: pt.accel,
+                decel: pt.decel,
+                switch_points: Vec::new(),
+                src_line: line,
+                obj_no: self.obj_no,
+            };
+            let length = mv.param_length();
+            fold_aux_limits(&mut mv, length, &pt.aux_feed, &pt.aux_accel, &pt.aux_decel);
+            if mv.feed <= 0.0 {
+                return Err(fail(
+                    "an auxiliary axis feed limit reduces this move's feed to zero".into(),
+                ));
+            }
+            mv.switch_points = resolve_switch_points(pt.switches, length, pt.scale)?;
+            self.obj_no += 1;
+            out.push(GeoElem::Move(mv));
+        }
+        Ok(())
     }
+}
+
+/// A programmed `F<axis>`/`E<axis>` limits the axis' own motion; the axis
+/// moves Δ over the parameter length L, so it folds into a path limit.
+/// `length` is the move's parameter length; the three slices are the
+/// limits per auxiliary axis.
+fn fold_aux_limits(
+    mv: &mut GeoMove,
+    length: f64,
+    aux_feed: &[Option<f64>],
+    aux_accel: &[Option<f64>],
+    aux_decel: &[Option<f64>],
+) {
+    let (mut feed, mut accel, mut decel) = (mv.feed, mv.accel, mv.decel);
+    for (i, (a0, a1)) in mv.aux_start.iter().zip(mv.aux_end.iter()).enumerate() {
+        let delta = (a1 - a0).abs();
+        if delta <= 0.0 {
+            continue;
+        }
+        let ratio = length / delta;
+        if let Some(v) = aux_feed[i] {
+            feed = feed.min(v * ratio);
+        }
+        if let Some(a) = aux_accel[i] {
+            accel = Some(accel.map_or(a * ratio, |x: f64| x.min(a * ratio)));
+        }
+        if let Some(a) = aux_decel[i] {
+            decel = Some(decel.map_or(a * ratio, |x: f64| x.min(a * ratio)));
+        }
+    }
+    mv.feed = feed;
+    mv.accel = accel;
+    mv.decel = decel;
+}
+
+/// Resolve the switch points waiting for a path element against that
+/// element's length, in programmed order. `scale`: unit scale of `L` words.
+fn resolve_switch_points(
+    pending: impl IntoIterator<Item = PendingSwitch>,
+    length: f64,
+    scale: f64,
+) -> Result<Vec<SwitchPoint>, DecodeError> {
+    let mut points = Vec::new();
+    for p in pending {
+        let position = match p.pos {
+            // No L/O word: the switch point sits at the element's start.
+            None => 0.0,
+            Some(SwitchPos::Relative(o)) => o * length,
+            // L is a distance from the start, or from the end when negative.
+            Some(SwitchPos::Absolute(l)) if l >= 0.0 => l * scale,
+            Some(SwitchPos::Absolute(l)) => length + l * scale,
+        };
+        if !(0.0..=length).contains(&position) {
+            return Err(DecodeError::new(
+                p.src_line,
+                format!(
+                    "switch point H{} falls outside its {length:.6} long path element \
+                     (resolved to {position:.6})",
+                    p.number
+                ),
+            ));
+        }
+        points.push(SwitchPoint {
+            number: p.number,
+            position,
+            src_line: p.src_line,
+        });
+    }
+    points.sort_by(|a, b| a.position.total_cmp(&b.position));
+    Ok(points)
 }
 
 #[cfg(test)]
@@ -865,7 +1682,7 @@ mod tests {
             _ => panic!(),
         }
         assert!(Decoder::decode_source(Default::default(), "G1 X10\n").is_err()); // no feed
-        assert!(Decoder::decode_source(Default::default(), "G5 X10\n").is_err()); // unsupported
+        assert!(Decoder::decode_source(Default::default(), "G33 X10\n").is_err()); // unsupported
         assert!(Decoder::decode_source(Default::default(), "G2 F600 X10 Y10\n").is_err());
         // no IJK/R
     }
@@ -882,7 +1699,7 @@ mod tests {
 
         // Stage 2: the block lexes fine but has no meaning, on line 2.
         let decode_err =
-            Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nG5 X1\n").unwrap_err();
+            Decoder::decode_source(DecoderConfig::default(), "G1 F600 X10\nG33 X1\n").unwrap_err();
         match &decode_err {
             CncError::Decode(e) => assert_eq!(e.line, 2, "decode error line: {e}"),
             other => panic!("expected a decode error, got {other:?}"),

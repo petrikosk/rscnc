@@ -5,11 +5,159 @@ All notable changes to this project are documented here. The format follows
 [semantic versioning](https://semver.org/) (pre-1.0: a `0.x` series stays
 API-compatible).
 
-## [0.2.1] — unreleased
+## [0.3.0]
 
-A review pass over the whole motion layer, on top of 0.2.0. All changes are
-additive: no existing signature, type or variant changed, so 0.2.0 code keeps
-compiling. The planned velocities do change — see *Motion planning* below.
+The motion layer grows from "whole programs of lines and arcs" towards what a
+real control needs: per-axis limits, splines, a larger G-code dialect with
+variables and program flow, programs fed in pieces while the path runs,
+backward motion, software end positions — and a review pass over the planner
+and the interpolator that fixed a number of defects in 0.2.0.
+
+### Changed — breaking
+
+- **`Geometry`, `PlannedSegment` and `IplOutput` are `#[non_exhaustive]`.**
+  A `match` on `Geometry` needs a wildcard arm, and the two structs can no
+  longer be built with a literal (`IplOutput::default()`,
+  `Interpolator::output_buffer()`). This is what lets later versions add to
+  them without another breaking release.
+- **New variants and fields.** `Geometry::Spline` and `MotionMode::Spline`
+  (`G5`); `DecoderConfig` gained `fly_by_m`, `work_offsets`, `tool_lengths`,
+  `work_area_min`/`work_area_max`, `variables` and `max_executed_blocks`;
+  `AxisConfig` gained `max_velocity_jump`, `soft_limit_min` and
+  `soft_limit_max`; `LookAhead` gained `carry_acceleration`; `SyncEvent`
+  gained `fly_by`; `ModalState` gained `work_offset` and `tool_length`;
+  `ToolRadiusCorrection` gained `remove_loops`; `PlannedSegment` gained
+  `v_junction`, `jerk`, `v_carry` and `a_carry`; `IplOutput` gained
+  `reverse`; `CncError` gained `SoftLimit`. Struct literals of the
+  configuration types need the new fields or `..Default::default()`.
+- **`ModalState::position` is the machine position** (what the queue's
+  geometry is in). With work offsets and tool length compensation the
+  programmed position is no longer a single shift away from it.
+- **`CncController` applies the per-axis limits of `AxisConfig`.** The
+  acceleration and jerk limits of the axes were only handed to the driver
+  side; now they bound every move the axis takes part in (see *Per-axis
+  limits* below). A machine whose axis limits are tighter than its
+  `PathLimits` runs slower than under 0.2.0 — and within its limits.
+- **The planned motion changes.** Spans (one profile over many short moves),
+  exact jerk-limited reachability, the corrected junction velocity and
+  carried acceleration all change the velocity profile of a given program;
+  see *Fixed* and *Changed*.
+- **Tool radius correction removes contour details the tool does not fit
+  into** instead of refusing the program (`without_loop_removal()` restores
+  the strict behaviour), and refuses offset contours that cannot be closed
+  without cutting into the programmed one.
+- **rsruckig 3.1.2 is the minimum** (was 3.0).
+
+### Added
+
+Motion planning and interpolation:
+
+- **Per-axis limits** (`AxisLimit`, `AxisLimits`,
+  `Interpolator::with_axis_limits`, `LookAhead::plan_with_axis_limits`).
+  Velocity, acceleration and jerk limits of the path coordinates and of the
+  auxiliary axes are kept on top of the path limits: a move's limits become
+  `min(path limit, axis limit / share)`, where the share is the axis' part
+  of the path tangent (or an auxiliary axis' travel per path length), and
+  the centripetal acceleration on arcs and splines is held within the
+  acceleration limits of the axes it points along. `CncController` takes
+  them from `AxisConfig`.
+- **Velocity-jump limit per axis** (`AxisLimit::max_velocity_jump`,
+  `AxisConfig::with_velocity_jump`): the junction velocity is kept low
+  enough that no axis' velocity steps by more than its limit where the path
+  direction (or an auxiliary axis' rate) changes abruptly.
+- **Acceleration carried across span boundaries**
+  (`LookAhead::carry_acceleration`, on by default). A chain of short spans
+  with stepwise changing velocity limits — a run of small feed changes, a
+  curve cut into pieces of different curvature, smoothed corners — is
+  braked or accelerated in one ramp instead of one S-curve per span: the
+  plan gives such span ends a velocity *and* an acceleration
+  (`PlannedSegment::v_carry`, `a_carry`). A feed staircase of forty 0.2 mm
+  blocks from 50 down to 5 mm/s: 1666 → 1280 cycles at 1 ms, in 2 ramps
+  instead of 28; a 10 000-block CAM-style program with smoothed corners
+  runs 5 % shorter. The zero-acceleration plan is still planned and is what
+  the interpolator follows wherever it finds no profile straight to a
+  carried state. Planning costs more with it (1.0 → 1.4 ms for 10 000
+  blocks, up to 6× where nearly every span end carries).
+- **Fly-by M functions** (`DecoderConfig::fly_by_m`, `SyncEvent::fly_by`):
+  the listed M functions no longer stop the path; the moves on their two
+  sides are blended and the event is reported in the cycle that crosses the
+  junction.
+- **Streaming** (`Interpolator::append`, `append_pending`,
+  `remaining_length`, `discard_history`; `CncController::append_program`,
+  `decoder_mut`; `Decoder::decode_chunk`). More program can be appended
+  while the path runs; the look-ahead is extended over it, so the path does
+  not stop where the previous piece ended. `discard_history` drops what
+  lies behind, so a program fed in pieces does not grow without bound.
+- **Backward motion** (`Interpolator::set_reverse`, `is_reverse`,
+  `IplOutput::reverse`): the path stops, then runs back along the moves it
+  has traversed, through the same look-ahead, with halt, override and
+  single-step; forward again, it resumes the program without repeating
+  events, dwells and switch points it has already reported.
+- **Software end positions** (`AxisConfig::with_soft_limits`,
+  `CncController::check_soft_limits`, `CncError::SoftLimit`): a program
+  that would move an axis out of its range is refused when it is loaded or
+  appended, with the source line of the move. Arc bulges and spline sweeps
+  are included, through the kinematics.
+- `Interpolator::planned_segments`, `PlannedSegment::v_junction` and
+  `jerk`; `LookAhead::velocity_limit` — a move's velocity ceiling
+  independent of the programmed feed: what an override above 100 % can
+  raise the move to.
+
+Geometry and preprocessing:
+
+- **Splines.** `Geometry::Spline` / `SplineSeg`: polynomial (Bézier)
+  segments with an arc-length table, curvature-limited like arcs, usable
+  everywhere a line or an arc is (look-ahead, per-axis limits, soft limits,
+  reverse). `G5` programs a curve through points (see below).
+- **`CornerSmoothing`** — the `G64 P…` idea: the corner between two linear
+  moves is replaced by a quintic blend that stays within a tolerance of the
+  programmed corner and joins both lines with continuous curvature, in any
+  spatial orientation.
+- **Loop removal in `ToolRadiusCorrection`**: a slot narrower than the tool,
+  a step lower than its radius or an inside arc smaller than the tool is
+  passed over without cutting into the contour; switch points and
+  auxiliary travel of the removed elements are handed on. The module docs
+  list what it does not detect (bottlenecks between distant parts of a
+  contour).
+- `Segment::pose_at(s)` (point and tangent in one call);
+  `Geometry::max_curvature`, `reversed`, `bounding_box`, `axis_extents` and
+  `for_each_extreme`; `ArcSeg::reversed`, `GeoMove::reversed`,
+  `GeoElem::is_stop`.
+
+G-code dialect (see the `decoder` module docs):
+
+- **Variables and program flow** in the style of Fanuc Macro B: `#1 = …`,
+  computed words (`X[#1 + 2]`), expressions with `+ - * / MOD`,
+  comparisons, `AND OR XOR` and the usual functions; `GOTO`, `IF … GOTO`,
+  `IF … THEN`, `WHILE … DO … END`; subprograms with `M98 P… K…` / `M99`.
+  `DecoderConfig::variables` presets variables, `Decoder::variable` /
+  `set_variable` read and write them, `DecoderConfig::max_executed_blocks`
+  stops a program that never ends.
+- **Work coordinate systems** `G54`…`G59` (`DecoderConfig::work_offsets`)
+  and `G53` (machine coordinates for one block).
+- **Tool length compensation** `G43` / `G49`
+  (`DecoderConfig::tool_lengths`).
+- **Working area** `G25` / `G26` (`DecoderConfig::work_area_min`/`max`,
+  `Decoder::work_area`): a path element outside it is refused with its
+  block.
+- **`G5`** — a Catmull-Rom spline through the programmed points, with
+  natural ends.
+- **Chunked decoding**: `Decoder::decode_chunk` keeps the modal state (and
+  the variables) from one piece of text to the next; `Decoder::resume`
+  clears the program end set by `M2`/`M30`, and `flush` / `finish` close a
+  program decoded block by block.
+
+Project:
+
+- `lib/tests/stress.rs` — random programs (short and long segments, arcs,
+  splines, rapids, dwells, events, auxiliary moves, `E` limits, switch
+  points, per-axis limits) under random override / halt / single-step /
+  reverse actions and streamed in pieces, across several limit sets and
+  cycle times. `RSCNC_STRESS_CASES` and `RSCNC_STRESS_FIRST` widen the run
+  or move it to other seeds.
+- Criterion benchmarks (`cargo bench -p rscnc`), cargo-fuzz targets for the
+  lexer, the decoder and the offline pipeline (`fuzz/`), and a CI workflow
+  (format, clippy, tests, docs, a long stress run, a fuzz smoke test).
 
 ### Fixed
 
@@ -86,8 +234,31 @@ Motion planning and interpolation (each pinned by a test in
   their own reallocated it. `Interpolator::load` now sizes it for the most
   switch points one cycle can cross in the loaded program.
 
+- **A halted stop took the limits of a move it ran into one cycle late.**
+  The stop is re-planned with each move's own deceleration and jerk limit;
+  it did so at the end of the cycle that crossed the junction. On a plan
+  without margin that cycle was enough to overrun a planned stop by a
+  fraction of a micrometre (position frozen at the end point, velocity
+  jumping to zero). The cycle is now split at the junction.
+- **The trajectory generator found no profile for some valid requests**, and
+  the cycle failed: a rest-to-rest move of exactly the length at which an
+  acceleration limit is just reached (`2·a³/j²`), moves with separate
+  acceleration and deceleration limits (`E`) of some thousands, and some
+  re-plans from a running profile. These are fixed in rsruckig 3.1.2,
+  which is now required.
+
 Decoding and preprocessing:
 
+- **`CornerRounding` accepted a NaN or negative radius** and wrote it into
+  the arc geometry. It is refused.
+- **Tool radius correction of a contour that turns straight back** (out and
+  back along the same line) had no corner rule for the exact reversal; the
+  two offset lines are joined by a half circle around the tip.
+- **`CurvatureVelocityLimit` looked at the curvature at the two ends of an
+  arc only**; it uses the highest curvature along the element (which
+  matters for spiral arcs and splines).
+- **A block with an invalid `T` number** was refused only after its motion
+  had been put into the queue.
 - **Full circle without axis words** (`G2 I-5`) was rejected, and as a modal
   follow-up block (`I-5` alone after a `G2`) silently skipped.
 - **A number too long for an `f64`** (hundreds of digits) parsed to infinity
@@ -123,26 +294,14 @@ Decoding and preprocessing:
   and now takes 8 ms. The look-ahead pass does more (exact ramps, spans) and
   went from 41 to 55 ns/segment. (Measured on the 0.1.1 code base, before
   the 0.2.0 words.)
-- **Dependency.** rsruckig 3.1 is now the minimum (was 3.0). It fixes, among
-  others, step-1 failures for states beyond the velocity or acceleration
-  limits and the jerk signs of `UDUD` profiles in the velocity interface,
-  both of which the interpolator relies on when it brakes down to a lowered
-  override.
+- **Dependency.** rsruckig 3.1.2 is now the minimum (was 3.0). The 3.1
+  series fixes, among others, step-1 failures for states beyond the
+  velocity or acceleration limits, at the borders between profile types
+  and with high or asymmetric acceleration limits, and the jerk signs of
+  `UDUD` profiles in the velocity interface, all of which the interpolator
+  relies on.
 
-### Added
-
-- `LookAhead::velocity_limit` — a move's velocity ceiling independent of the
-  programmed feed (path limit, curvature cap, auxiliary axis caps): what a
-  feed override above 100 % can raise the move to.
-- `Segment::pose_at(s)` — point and tangent in one call (a provided method;
-  lines and arcs specialize it).
-- `lib/tests/stress.rs` — random programs (short and long segments, arcs,
-  rapids, dwells, events, auxiliary moves, `E` limits, switch points) under
-  random override / halt / single-step actions, across several limit sets
-  and cycle times. `RSCNC_STRESS_CASES` and `RSCNC_STRESS_FIRST` widen the
-  run or move it to other seeds.
-
-## [0.2.0] — unreleased
+## [0.2.0]
 
 The DIN 66025 dialect grows the CODESYS SoftMotion words a real program uses
 for dynamics and switching — and corrects the meaning of `F`. A program that
