@@ -116,53 +116,66 @@ impl Preprocessor for ToolRadiusCorrection {
     }
 
     fn process(&mut self, queue: GeoQueue) -> Result<GeoQueue, PreprocessError> {
-        let elems: Vec<GeoElem> = queue.into_iter().collect();
-        let mut out: Vec<GeoElem> = Vec::with_capacity(elems.len());
-        let mut i = 0;
-        while i < elems.len() {
-            let mode = match &elems[i] {
+        let mut out: Vec<GeoElem> = Vec::with_capacity(queue.len());
+        let mut elems = queue.into_iter().peekable();
+        while let Some(elem) = elems.next() {
+            let mode = match &elem {
                 GeoElem::Move(m) if m.trc != TrcMode::Off => m.trc,
-                other => {
-                    out.push(other.clone());
-                    i += 1;
+                _ => {
+                    out.push(elem);
                     continue;
                 }
             };
-            // Collect the chain: moves with the same mode; other queue elements
-            // in between are re-emitted after the corrected move they follow.
+            // Collect the chain: the moves with the same mode. Everything
+            // else in between — other queue elements and moves that only
+            // drive auxiliary axes — is re-emitted after the corrected move
+            // it follows, tagged with the number of chain moves before it.
             let mut chain: Vec<GeoMove> = Vec::new();
             let mut inter: Vec<(usize, GeoElem)> = Vec::new();
-            while i < elems.len() {
-                match &elems[i] {
-                    GeoElem::Move(m) if m.trc == mode => {
-                        chain.push(m.clone());
-                        i += 1;
-                    }
-                    GeoElem::Move(_) => break,
-                    other => {
-                        inter.push((chain.len(), other.clone()));
-                        i += 1;
-                    }
+            let mut next = Some(elem);
+            while let Some(e) = next.take() {
+                match e {
+                    GeoElem::Move(m) if !is_stationary(&m) => chain.push(m),
+                    other => inter.push((chain.len(), other)),
                 }
+                next = elems.next_if(|e| !matches!(e, GeoElem::Move(m) if m.trc != mode));
             }
-            let corrected = self.correct_chain(&chain, mode)?;
-            // Emit: elements interleaved at chain position 0 first, then per
-            // source move its corrected pieces followed by its interleaved elements.
-            for (pos, e) in inter.iter().filter(|(p, _)| *p == 0) {
-                let _ = pos;
-                out.push(e.clone());
-            }
-            for k in 0..chain.len() {
-                for t in corrected.iter().filter(|t| t.src == k) {
-                    out.push(GeoElem::Move(t.mv.clone()));
+            let corrected = if chain.is_empty() {
+                Vec::new()
+            } else {
+                self.correct_chain(&chain, mode)?
+            };
+            // Emit per source move: the elements interleaved before it, then
+            // its corrected pieces (which are ordered by source move).
+            let mut inter = inter.into_iter().peekable();
+            let mut corrected = corrected.into_iter().peekable();
+            // End point of the corrected path so far
+            let mut at: Option<PathPoint> = None;
+            for k in 0..=chain.len() {
+                while let Some((_, e)) = inter.next_if(|(pos, _)| *pos == k) {
+                    out.push(match (e, at) {
+                        // A stationary move happens where the corrected
+                        // path is, not at the programmed contour point.
+                        (GeoElem::Move(mut m), Some(p)) => {
+                            m.geo = Geometry::Line(LineSeg::new(p, p));
+                            GeoElem::Move(m)
+                        }
+                        (e, _) => e,
+                    });
                 }
-                for (_, e) in inter.iter().filter(|(p, _)| *p == k + 1) {
-                    out.push(e.clone());
+                while let Some(t) = corrected.next_if(|t| t.src == k) {
+                    at = Some(t.mv.geo.end());
+                    out.push(GeoElem::Move(t.mv));
                 }
             }
         }
         Ok(out.into_iter().collect())
     }
+}
+
+/// A move without path geometry (it only drives auxiliary axes).
+fn is_stationary(mv: &GeoMove) -> bool {
+    matches!(&mv.geo, Geometry::Line(l) if l.length() < EPS)
 }
 
 impl ToolRadiusCorrection {

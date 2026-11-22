@@ -1,6 +1,6 @@
 [package]
 name = "rscnc"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Petri Koskinen"]
 edition = "2021"
 description = "CNC motion control layer (DIN 66025 G-code decoder, path preprocessing, jerk-limited look-ahead interpolator) on top of the rsruckig trajectory generator"
@@ -11,7 +11,7 @@ keywords = ["cnc", "gcode", "motion", "trajectory", "interpolation"]
 categories = ["science::robotics", "algorithms"]
 
 [dependencies]
-rsruckig = "3"
+rsruckig = "3.1"
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]

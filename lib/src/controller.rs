@@ -108,8 +108,9 @@ impl<const N: usize, K: Kinematics<N>> CncController<N, K> {
         driver: &mut impl AxisDriver<N>,
         max_cycles: usize,
     ) -> Result<usize, CncError> {
+        let mut out = self.interpolator.output_buffer();
         for n in 0..max_cycles {
-            let out = self.cycle(driver)?;
+            self.cycle_into(driver, &mut out)?;
             if out.state == IplState::Finished {
                 return Ok(n + 1);
             }

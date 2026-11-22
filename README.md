@@ -12,10 +12,13 @@ G-code ──► Decoder ──► GeoQueue ──► Preprocessors ──► In
 ```
 
 The interpolator runs rsruckig as a **1-DoF planner on the path parameter `s`** (arc length):
-per segment, the jerk-limited profile goes from the current `(s, ṡ, s̈)` to `(L, v_exit, 0)`,
-where the junction velocity `v_exit` comes from a look-ahead pass — so consecutive segments
-**blend without stopping**. Feed-override changes, pause and resume are single profile
-retargets from the current state, which is exactly what Ruckig was built for.
+the jerk-limited profile goes from the current `(s, ṡ, s̈)` to `(L, v_exit, 0)`, where the
+junction velocity `v_exit` comes from a look-ahead pass — so consecutive segments **blend
+without stopping**. Consecutive segments whose junctions do not hold the velocity back (or
+hold it back evenly, as on a finely segmented curve) form one *span* that is traversed by a
+single profile, so a contour chopped into thousands of short moves accelerates like one long
+move. Feed-override changes, pause and resume are single profile retargets from the current
+state, which is exactly what Ruckig was built for.
 
 ## Features
 
@@ -37,12 +40,15 @@ retargets from the current state, which is exactly what Ruckig was built for.
   axes (`A B C U V W ...`), which interpolate linearly over the path and cap the path
   velocity so their own limits are never exceeded.
 - **Look-ahead planner** — per-segment velocity caps (feed, machine cap, centripetal
-  `v ≤ √(a_n/κ)`, aux-axis caps) plus Grbl-style junction-deviation corner velocities with
-  backward/forward reachability passes.
-- **Jerk-limited interpolation** — one rsruckig `calculate()` per segment, sampled with
+  `v ≤ √(a_n/κ)`, aux-axis caps) plus Grbl-style junction-deviation corner velocities
+  (auxiliary axes included; a polyline sampling a curve obeys the same centripetal budget
+  as the arc it approximates) with backward/forward reachability passes that use the exact
+  jerk-limited ramp distance.
+- **Jerk-limited interpolation** — one rsruckig `calculate()` per span, sampled with
   `Trajectory::at_time` under exact time bookkeeping (no cycle-quantization error at
   segment boundaries). Position, velocity and acceleration are continuous everywhere.
-- **Feed override & control** — override changeable every cycle (0…150 %+), override 0 /
+- **Feed override & control** — override changeable every cycle (0…150 %+; above 100 % it
+  never lifts a move past the machine, curvature, junction or aux-axis limits), override 0 /
   `halt()` decelerates to a jerk-limited pause (velocity-interface stop that may safely
   cross blended segment boundaries), `resume()` retargets back, single-step mode stops at
   every segment end.
@@ -159,6 +165,13 @@ cargo test
   event/dwell timing, single-step, aux-axis caps
 - property tests: random polylines and arcs — limits, geometry adherence (every sampled
   point on the programmed path), exact endpoints
+- regression tests (`lib/tests/regression.rs`): one test per defect fixed so far — stalls,
+  jolts, limit violations, rejected programs
+- stress test (`lib/tests/stress.rs`): random programs under random override / halt /
+  single-step actions across several limit sets and cycle times; the path motion must stay
+  one continuous jerk-limited profile within the programmed `E` limits, report every switch
+  point once, and end exactly at the program end. `RSCNC_STRESS_CASES=100000 cargo test
+  --release --test stress` runs a longer soak (`RSCNC_STRESS_FIRST` moves it to other seeds)
 
 ## Scope and future work
 
@@ -169,10 +182,15 @@ programs, backward move on path, fieldbus drivers (EtherCAT/CiA402), `no_std`.
 
 Known v1 behavior notes:
 
-- Junction reachability uses an acceleration formula with a configurable margin
-  (`LookAhead::accel_margin`, default 0.8) to leave headroom for jerk; the interpolator
-  additionally clamps each segment's exit velocity to what is reachable from the current
-  state, so profiles never reverse along the path.
+- Junction reachability uses the exact jerk-limited ramp distance, derated by a configurable
+  margin on acceleration and jerk (`LookAhead::accel_margin`, default 0.8) as headroom for
+  override changes. A retarget (override, single-step) that the current state cannot follow
+  any more — typically in the last ramp before a junction — keeps the running profile and
+  takes effect at the next span; profiles never reverse or stall along the path.
+- Junction deviation limits the *centripetal* effect of a corner, not the jump itself: at a
+  corner taken at speed the axis velocities change direction within one cycle (tangential
+  velocity, acceleration and jerk stay continuous and limited). Lower
+  `LookAhead::junction_deviation`, or insert `CornerRounding`, where the drives need less.
 - An M event forces an exact stop at its program position (CoDeSys default for
   synchronized M functions).
 - A pause (override → 0) brakes time-optimally and may cross blended segment boundaries;

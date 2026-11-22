@@ -43,10 +43,13 @@ pub struct CartesianKinematics<const N: usize> {
 }
 
 impl<const N: usize> CartesianKinematics<N> {
-    /// Path axes first (2 or 3), all remaining axes auxiliary, in order.
+    /// The given path axes carry the geometry; every other machine axis is
+    /// auxiliary, in ascending index order (the order
+    /// [`CncController`](crate::CncController) assigns auxiliary limits in).
     pub fn new(path_axes: PathAxes) -> Self {
-        let path_count = path_axes.count();
-        let aux_axes = (path_count..N).collect();
+        let aux_axes = (0..N)
+            .filter(|axis| (0..3).all(|i| path_axes.axis(i) != Some(*axis)))
+            .collect();
         Self {
             path_axes,
             aux_axes,

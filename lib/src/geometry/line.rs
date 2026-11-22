@@ -59,4 +59,23 @@ impl Segment for LineSeg {
     fn end(&self) -> PathPoint {
         self.p1
     }
+
+    #[inline]
+    fn pose_at(&self, s: f64) -> (PathPoint, PathPoint) {
+        let d = sub(&self.p1, &self.p0);
+        let len = norm(&d);
+        if len > 0.0 {
+            let u = (s / len).clamp(0.0, 1.0);
+            (
+                [
+                    self.p0[0] + d[0] * u,
+                    self.p0[1] + d[1] * u,
+                    self.p0[2] + d[2] * u,
+                ],
+                [d[0] / len, d[1] / len, d[2] / len],
+            )
+        } else {
+            (self.p0, [0.0; 3])
+        }
+    }
 }

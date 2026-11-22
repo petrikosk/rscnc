@@ -205,6 +205,36 @@ impl Segment for ArcSeg {
     fn end(&self) -> PathPoint {
         self.point_at(self.length())
     }
+
+    #[inline]
+    fn pose_at(&self, s: f64) -> (PathPoint, PathPoint) {
+        let len = self.length();
+        let u = if len > 0.0 {
+            (s / len).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (i0, i1, i2) = self.plane.axes();
+        let (sin, cos) = (self.theta0 + self.sweep * u).sin_cos();
+        let r = self.radius_at_u(u);
+        let mut p = [0.0; 3];
+        p[i0] = self.center[i0] + r * cos;
+        p[i1] = self.center[i1] + r * sin;
+        p[i2] = self.center[i2] + self.helix_delta * u;
+        // dp/du, as in `tangent_at`
+        let dr = self.r_end - self.r_start;
+        let d0 = dr * cos - r * sin * self.sweep;
+        let d1 = dr * sin + r * cos * self.sweep;
+        let d2 = self.helix_delta;
+        let n = (d0 * d0 + d1 * d1 + d2 * d2).sqrt();
+        let mut t = [0.0; 3];
+        if n > 0.0 {
+            t[i0] = d0 / n;
+            t[i1] = d1 / n;
+            t[i2] = d2 / n;
+        }
+        (p, t)
+    }
 }
 
 #[cfg(test)]

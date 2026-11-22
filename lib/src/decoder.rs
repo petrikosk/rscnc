@@ -411,8 +411,15 @@ impl Decoder {
         } else if axis.iter().any(Option::is_some) || aux.iter().any(Option::is_some) {
             self.pending_switches.append(&mut switches);
             self.decode_motion(line, &axis, &aux, &ijk, r_word, out)?;
+        } else if matches!(self.state.motion, MotionMode::ArcCw | MotionMode::ArcCcw)
+            && (r_word.is_some() || ijk.iter().any(Option::is_some))
+        {
+            // Arc data without axis words: the end point is the start point,
+            // i.e. a full circle (`G2 I-5`), also on a modal follow-up block.
+            self.pending_switches.append(&mut switches);
+            self.decode_motion(line, &axis, &aux, &ijk, r_word, out)?;
         } else if g_codes.contains(&2) || g_codes.contains(&3) {
-            return Err(err("arc move without axis words".into()));
+            return Err(err("arc move without axis words or I/J/K".into()));
         } else {
             // A block with no path element of its own: its switch points ride
             // on the next element, at its start.
@@ -472,13 +479,12 @@ impl Decoder {
                 };
             }
         }
-        let aux_start = self.state.aux_position.clone();
-        let mut aux_end = aux_start.clone();
+        let mut aux_end = self.state.aux_position.clone();
         for (i, v) in aux.iter().enumerate() {
             if let Some(v) = v {
                 aux_end[i] = match self.state.distance {
                     DistanceMode::Absolute => v - self.state.aux_g92_offset[i],
-                    DistanceMode::Incremental => aux_start[i] + v,
+                    DistanceMode::Incremental => aux_end[i] + v,
                 };
             }
         }
@@ -529,7 +535,7 @@ impl Decoder {
         };
 
         self.state.position = target;
-        self.state.aux_position = aux_end.clone();
+        let aux_start = core::mem::replace(&mut self.state.aux_position, aux_end.clone());
 
         let mut mv = GeoMove {
             geo,

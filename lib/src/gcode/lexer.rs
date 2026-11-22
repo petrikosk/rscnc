@@ -57,120 +57,157 @@ pub fn lex(source: &str) -> Result<Vec<ParsedBlock>, GcodeError> {
     let mut blocks = Vec::new();
     for (idx, raw_line) in source.lines().enumerate() {
         let src_line = idx + 1;
-        let words = lex_line(raw_line, src_line)?;
-        if words.is_empty() {
+        let (number, words) = lex_line(raw_line, src_line)?;
+        if number.is_none() && words.is_empty() {
             continue;
-        }
-        let mut number = None;
-        let mut rest = Vec::with_capacity(words.len());
-        for w in words {
-            if w.letter == 'N' && number.is_none() && rest.is_empty() {
-                if w.value < 0.0 || w.value.fract() != 0.0 {
-                    return Err(GcodeError::new(
-                        src_line,
-                        format!("invalid line number N{}", w.value),
-                    ));
-                }
-                number = Some(w.value as u32);
-            } else {
-                rest.push(w);
-            }
         }
         blocks.push(ParsedBlock {
             number,
-            words: rest,
+            words,
             src_line,
         });
     }
     Ok(blocks)
 }
 
-fn lex_line(line: &str, src_line: usize) -> Result<Vec<Word>, GcodeError> {
+/// Byte length of the whitespace character at byte offset `i` (0 if there
+/// is none).
+fn whitespace_len(line: &str, i: usize) -> usize {
+    match line.as_bytes().get(i) {
+        Some(b' ' | b'\t') => 1,
+        Some(b) if b.is_ascii() => usize::from((*b as char).is_whitespace()),
+        Some(_) => line[i..]
+            .chars()
+            .next()
+            .filter(|c| c.is_whitespace())
+            .map_or(0, char::len_utf8),
+        None => 0,
+    }
+}
+
+/// Lex one line into its `N` number (if it leads the block) and its words.
+fn lex_line(line: &str, src_line: usize) -> Result<(Option<u32>, Vec<Word>), GcodeError> {
+    let bytes = line.as_bytes();
     let mut words = Vec::new();
-    let mut chars = line.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        match c {
-            ';' => break, // comment to end of line
-            '(' => {
+    let mut number = None;
+    // Byte offset; always on a character boundary.
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            // comment to end of line / program start-end marker
+            b';' | b'%' => break,
+            b'(' => {
                 // parenthesized comment; no nesting per RS-274
-                chars.next();
-                let mut closed = false;
-                for c in chars.by_ref() {
-                    if c == ')' {
-                        closed = true;
-                        break;
-                    }
-                }
-                if !closed {
-                    return Err(GcodeError::new(src_line, "unterminated comment"));
+                match bytes[i + 1..].iter().position(|&c| c == b')') {
+                    Some(len) => i += len + 2,
+                    None => return Err(GcodeError::new(src_line, "unterminated comment")),
                 }
             }
-            '%' => {
-                // program start/end marker - ignore the rest of the line
-                break;
-            }
-            c if c.is_whitespace() => {
-                chars.next();
-            }
-            c if c.is_ascii_alphabetic() => {
-                let letter = c.to_ascii_uppercase();
-                chars.next();
+            b if b.is_ascii_alphabetic() => {
+                let letter = b.to_ascii_uppercase() as char;
+                i += 1;
                 // A second letter immediately after E or F qualifies the word
                 // (`FF`/`EF` for G0, `F<axis>`/`E<axis>` for one auxiliary
                 // axis). No whitespace is allowed between the two letters, so
                 // an ordinary word is never mistaken for a qualified one.
-                let suffix = match (letter, chars.peek()) {
-                    ('E' | 'F', Some(c)) if c.is_ascii_alphabetic() => {
-                        let s = c.to_ascii_uppercase();
-                        chars.next();
-                        Some(s)
+                let suffix = match bytes.get(i) {
+                    Some(c) if matches!(letter, 'E' | 'F') && c.is_ascii_alphabetic() => {
+                        i += 1;
+                        Some(c.to_ascii_uppercase() as char)
                     }
                     _ => None,
                 };
                 // skip whitespace between letter and number
-                while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                    chars.next();
+                loop {
+                    let n = whitespace_len(line, i);
+                    if n == 0 {
+                        break;
+                    }
+                    i += n;
                 }
-                let mut num = String::new();
-                if chars.peek() == Some(&'+') || chars.peek() == Some(&'-') {
-                    num.push(chars.next().unwrap());
+                let start = i;
+                if matches!(bytes.get(i), Some(b'+' | b'-')) {
+                    i += 1;
                 }
-                while chars
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_digit() || *c == '.' || c.is_whitespace())
-                {
-                    let c = chars.next().unwrap();
-                    if !c.is_whitespace() {
-                        num.push(c);
+                // End of the number's last character, and whether whitespace
+                // is embedded in the number (`X 1 2 . 5`).
+                let mut end = i;
+                let mut embedded = false;
+                loop {
+                    if matches!(bytes.get(i), Some(b'0'..=b'9' | b'.')) {
+                        embedded |= i != end;
+                        i += 1;
+                        end = i;
+                    } else {
+                        let n = whitespace_len(line, i);
+                        if n == 0 {
+                            break;
+                        }
+                        i += n;
                     }
                 }
-                let value: f64 = num.parse().map_err(|_| {
-                    let name = Word::name_of(letter, suffix);
-                    GcodeError::new(
-                        src_line,
-                        format!("word '{name}' is missing a valid number (got '{num}')"),
-                    )
-                })?;
-                words.push(Word {
-                    letter,
-                    suffix,
-                    value,
-                    line: src_line,
-                });
+                // The common case parses straight from the source text
+                let text = &line[start..end];
+                let parsed = if embedded {
+                    let packed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    packed.parse::<f64>()
+                } else {
+                    text.parse::<f64>()
+                };
+                let value = match parsed {
+                    // A digit string too long for an f64 parses to infinity
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        let name = Word::name_of(letter, suffix);
+                        return Err(GcodeError::new(
+                            src_line,
+                            format!("number of word '{name}' is out of range"),
+                        ));
+                    }
+                    Err(_) => {
+                        let name = Word::name_of(letter, suffix);
+                        let num: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                        return Err(GcodeError::new(
+                            src_line,
+                            format!("word '{name}' is missing a valid number (got '{num}')"),
+                        ));
+                    }
+                };
+                if letter == 'N' && number.is_none() && words.is_empty() {
+                    if value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
+                        return Err(GcodeError::new(
+                            src_line,
+                            format!("invalid line number N{value}"),
+                        ));
+                    }
+                    number = Some(value as u32);
+                } else {
+                    words.push(Word {
+                        letter,
+                        suffix,
+                        value,
+                        line: src_line,
+                    });
+                }
             }
-            '/' if words.is_empty() => {
+            b'/' if words.is_empty() && number.is_none() => {
                 // block-delete character at line start: skip the whole line
-                return Ok(Vec::new());
+                return Ok((None, Vec::new()));
             }
-            other => {
-                return Err(GcodeError::new(
-                    src_line,
-                    format!("unexpected character '{other}'"),
-                ));
+            _ => {
+                let n = whitespace_len(line, i);
+                if n == 0 {
+                    let other = line[i..].chars().next().unwrap_or('?');
+                    return Err(GcodeError::new(
+                        src_line,
+                        format!("unexpected character '{other}'"),
+                    ));
+                }
+                i += n;
             }
         }
     }
-    Ok(words)
+    Ok((number, words))
 }
 
 #[cfg(test)]
@@ -238,5 +275,46 @@ mod tests {
         assert!(lex("G1 X\n").is_err());
         assert!(lex("G1 (unterminated\n").is_err());
         assert!(lex("G1 X1 #5\n").is_err());
+        assert!(lex("G1 X-\n").is_err());
+        assert!(lex("G1 X1.2.3\n").is_err());
+        assert!(lex("N1.5 G1 X1\n").is_err());
+    }
+
+    #[test]
+    fn overflowing_number_is_rejected() {
+        let e = lex(&format!("G1 X1\nG1 X{}\n", "9".repeat(400))).unwrap_err();
+        assert_eq!(e.line, 2);
+        assert!(e.message.contains("out of range"), "{}", e.message);
+    }
+
+    #[test]
+    fn line_numbers_and_markers() {
+        let blocks = lex("%\nN10\nN20 G1 X1 N5\n(only a comment)\nG1 X2 (a) Y3 ; b\n").unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!((blocks[0].number, blocks[0].words.len()), (Some(10), 0));
+        // only a leading N is the block number
+        assert_eq!(blocks[1].number, Some(20));
+        assert_eq!(blocks[1].words.len(), 3);
+        assert_eq!(blocks[1].words[2].letter, 'N');
+        assert_eq!(blocks[2].words.len(), 3);
+        assert_eq!(blocks[2].src_line, 5);
+    }
+
+    #[test]
+    fn non_ascii_text() {
+        // inside comments anything goes; outside it is an error, not a panic
+        assert_eq!(lex("G1 X1 (päätepiste ä)\n").unwrap()[0].words.len(), 2);
+        let e = lex("G1 Xä\n").unwrap_err();
+        assert!(
+            e.message.contains("missing a valid number"),
+            "{}",
+            e.message
+        );
+        assert!(lex("G1 X1 ä\n").unwrap_err().message.contains('ä'));
+        // Unicode whitespace counts as whitespace
+        assert_eq!(
+            lex("G1\u{a0}X1\u{2003}2\n").unwrap()[0].words[1].value,
+            12.0
+        );
     }
 }

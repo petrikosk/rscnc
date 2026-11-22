@@ -25,6 +25,13 @@ pub trait Segment {
     fn start(&self) -> PathPoint;
     /// End point of the segment (`point_at(length())`).
     fn end(&self) -> PathPoint;
+    /// Position and unit tangent at path parameter `s` in one call (what the
+    /// interpolator needs every cycle). The default simply calls
+    /// [`point_at`](Self::point_at) and [`tangent_at`](Self::tangent_at);
+    /// implementations may share work between the two.
+    fn pose_at(&self, s: f64) -> (PathPoint, PathPoint) {
+        (self.point_at(s), self.tangent_at(s))
+    }
 }
 
 /// Closed set of segment geometries used in the queue's hot path.
@@ -71,6 +78,13 @@ impl Segment for Geometry {
         match self {
             Geometry::Line(l) => l.end(),
             Geometry::Arc(a) => a.end(),
+        }
+    }
+    #[inline]
+    fn pose_at(&self, s: f64) -> (PathPoint, PathPoint) {
+        match self {
+            Geometry::Line(l) => l.pose_at(s),
+            Geometry::Arc(a) => a.pose_at(s),
         }
     }
 }
